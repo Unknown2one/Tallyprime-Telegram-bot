@@ -6,10 +6,10 @@ const { addDraft, buildDraftButtons } = require('./whatsapp');
 const mcpManager = require('../mcp-manager');
 
 /**
- * Returns the constant payment gateway link.
+ * Returns the configured payment gateway link.
  */
 async function generateClickableUpiLink(upiId, amount, note, rlog) {
-    return 'https://tinyurl.com/PaytoManojEnterprises';
+    return config.PAYMENT_LINK;
 }
 
 /**

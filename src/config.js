@@ -11,4 +11,5 @@ module.exports = {
     DASHBOARD_PORT: parseInt(process.env.DASHBOARD_PORT || '3002'),
     SARVAM_API_KEY: process.env.SARVAM_API_KEY || 'sk_f1k75b2i_A1eyCeWzheMI5C6epmyF5NFV',
     DISCOUNT_LEDGER: process.env.DISCOUNT_LEDGER || 'Discount Allowed',
+    PAYMENT_LINK: process.env.PAYMENT_LINK || 'https://tinyurl.com/PaytoManojEnterprises',
 };
