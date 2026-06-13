@@ -1,0 +1,1552 @@
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { z } from 'zod';
+import dotenv from 'dotenv';
+import { fetchReport, importMasters, invokeTallyAction, queryCollection, renameObjectArrayProperties } from './tally.mjs';
+import { cacheTable, executeSQL } from './database.mjs';
+import { lstCollectionFields, lstOptionCountryState } from './definition.mjs';
+import { utility } from './utility.mjs';
+import { exec } from 'node:child_process';
+import { promisify } from 'node:util';
+import path from 'node:path';
+import fs from 'node:fs/promises';
+
+const execAsync = promisify(exec);
+
+dotenv.config({ override: true, quiet: true });
+
+const lstCollections = lstCollectionFields.map((item) => item.collection);
+
+// --- Phonetic Roman / Hinglish Transliteration & Normalization Helpers ---
+const DevanagariMapping: Record<string, string> = {
+  'अ': 'a', 'आ': 'a', 'इ': 'i', 'ई': 'ee', 'उ': 'u', 'ऊ': 'oo', 'ऋ': 'ri',
+  'ए': 'e', 'ऐ': 'ai', 'ओ': 'o', 'औ': 'au', 'अं': 'an', 'अः': 'ah',
+  'ा': 'a', 'ि': 'i', 'ी': 'ee', 'ु': 'u', 'ू': 'oo', 'े': 'e', 'ै': 'ai',
+  'ो': 'o', 'ौ': 'au', 'ं': 'n', 'ः': 'h', 'ॅ': 'a', 'ॉ': 'o',
+  'क': 'k', 'ख': 'kh', 'ग': 'g', 'घ': 'gh', 'ङ': 'n',
+  'च': 'ch', 'छ': 'chh', 'ज': 'j', 'झ': 'jh', 'ञ': 'n',
+  'ट': 't', 'ठ': 'th', 'ड': 'd', 'ढ': 'dh', 'ण': 'n',
+  'त': 't', 'थ': 'th', 'द': 'd', 'ध': 'dh', 'न': 'n',
+  'प': 'p', 'फ': 'ph', 'ब': 'b', 'भ': 'bh', 'म': 'm',
+  'य': 'y', 'र': 'r', 'ल': 'l', 'व': 'v', 'श': 'sh', 'ष': 'sh', 'स': 's', 'ह': 'h',
+  'क्ष': 'ksh', 'त्र': 'tr', 'ज्ञ': 'gy',
+  'श्र': 'shr', '्': '', '़': ''
+};
+
+function transliterateDevanagari(text: string): string {
+  if (!text) return '';
+  const words = text.split(/\s+/);
+  const mappedWords = words.map(word => {
+    let wordResult = '';
+    for (let i = 0; i < word.length; i++) {
+      const char = word[i];
+      const nextChar = word[i + 1];
+      
+      if (char === 'श' && nextChar === '्' && word[i + 2] === 'र') {
+        wordResult += 'shr';
+        i += 2;
+        continue;
+      }
+      
+      const mapped = DevanagariMapping[char];
+      if (mapped !== undefined) {
+        wordResult += mapped;
+        
+        const isConsonant = 'कखगघङचछजझञटठडढणतथदधनपफबभमयरलवशषसह'.includes(char);
+        if (isConsonant && nextChar) {
+          const nextIsMatraOrVirama = 'ािीुूेैोौं्ॅॉ'.includes(nextChar);
+          if (!nextIsMatraOrVirama) {
+            wordResult += 'a';
+          }
+        }
+      } else {
+        wordResult += char;
+      }
+    }
+    return wordResult;
+  });
+  return mappedWords.join(' ').toLowerCase();
+}
+
+function normalizePhonetic(str: string): string {
+  return str.toLowerCase()
+    .replace(/w/g, 'v')
+    .replace(/ee/g, 'i')
+    .replace(/oo/g, 'u')
+    .replace(/aa/g, 'a')
+    .replace(/c(?!h)/g, 'k')
+    .replace(/y/g, 'i')
+    .replace(/z/g, 'j')
+    .replace(/[^a-z0-9\s]/g, '');
+}
+
+function parseTallyDate(dateStr: string): Date {
+  if (dateStr && dateStr.length === 8 && /^\d+$/.test(dateStr)) {
+    const y = parseInt(dateStr.substring(0, 4));
+    const m = parseInt(dateStr.substring(4, 6)) - 1;
+    const d = parseInt(dateStr.substring(6, 8));
+    return new Date(y, m, d);
+  }
+  return new Date(dateStr);
+}
+
+interface PendingInvoice {
+  date: string;
+  voucher_type: string;
+  voucher_number: string;
+  original_amount: number;
+  pending_amount: number;
+  narration: string;
+  days_old?: number;
+}
+
+function calculateFIFO(transactions: any[]): PendingInvoice[] {
+    let debits: PendingInvoice[] = [];
+    let totalCredits = 0;
+
+    const validTransactions = transactions.filter(t => 
+        t.voucher_type && 
+        t.voucher_type !== 'Closing Balance' && 
+        t.voucher_type !== 'Closing'
+    );
+
+    for (const t of validTransactions) {
+        const amt = parseFloat(t.amount) || 0;
+        
+        if (amt < 0) {
+            debits.push({
+                date: t.date,
+                voucher_type: t.voucher_type,
+                voucher_number: t.voucher_number || '-',
+                original_amount: Math.abs(amt),
+                pending_amount: Math.abs(amt),
+                narration: t.narration || ''
+            });
+        } else if (amt > 0) {
+            totalCredits += amt;
+        }
+    }
+
+    debits.sort((a, b) => parseTallyDate(a.date).getTime() - parseTallyDate(b.date).getTime());
+
+    for (let i = 0; i < debits.length; i++) {
+        if (totalCredits <= 0) break;
+
+        const debit = debits[i];
+        if (totalCredits >= debit.pending_amount) {
+            totalCredits -= debit.pending_amount;
+            debit.pending_amount = 0;
+        } else {
+            debit.pending_amount -= totalCredits;
+            totalCredits = 0;
+        }
+    }
+
+    const pendingInvoices = debits.filter(d => d.pending_amount > 0.01);
+
+    const today = new Date();
+    today.setHours(0,0,0,0);
+    
+    pendingInvoices.forEach(inv => {
+        const invDate = parseTallyDate(inv.date);
+        invDate.setHours(0,0,0,0);
+        const diffTime = Math.abs(today.getTime() - invDate.getTime());
+        inv.days_old = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+    });
+
+    return pendingInvoices;
+}
+
+function formatCurrency(amount: number): string {
+    return `₹${amount.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+
+function formatDateDisplay(dVal: any): string {
+    if (!dVal) return '';
+    if (dVal instanceof Date) {
+        const day = String(dVal.getDate()).padStart(2, '0');
+        const month = String(dVal.getMonth() + 1).padStart(2, '0');
+        const year = dVal.getFullYear();
+        return `${day}/${month}/${year}`;
+    }
+    const dStr = String(dVal);
+    if (dStr.length === 8 && /^\d+$/.test(dStr)) {
+        return `${dStr.substring(6,8)}/${dStr.substring(4,6)}/${dStr.substring(0,4)}`;
+    }
+    const d = new Date(dStr);
+    if (isNaN(d.getTime())) return dStr;
+    const day = String(d.getDate()).padStart(2, '0');
+    const month = String(d.getMonth() + 1).padStart(2, '0');
+    const year = d.getFullYear();
+    return `${day}/${month}/${year}`;
+}
+
+interface LedgerItem {
+  Name: string;
+  Parent: string;
+  LedgerMobile?: string;
+  Address?: string;
+}
+
+function resolveLedgerName(query: string, allLedgers: LedgerItem[]): { matchedLedger: LedgerItem | null; options: LedgerItem[] } {
+  const cleanQuery = query.toLowerCase().trim();
+  
+  // 1. Exact match first
+  let exact = allLedgers.find(l => l.Name.toLowerCase() === cleanQuery);
+  if (exact) {
+    return { matchedLedger: exact, options: [] };
+  }
+  
+  // 2. Simple substring check
+  let substringMatches = allLedgers.filter(l => l.Name.toLowerCase().includes(cleanQuery));
+  if (substringMatches.length === 1) {
+    return { matchedLedger: substringMatches[0], options: [] };
+  }
+  
+  // 3. Phonetic matching with score
+  const queryNorm = normalizePhonetic(cleanQuery);
+  const queryNormWords = queryNorm.split(/\s+/).filter(w => w.length > 0);
+  
+  const scored = allLedgers.map(l => {
+    const lLower = l.Name.toLowerCase();
+    const lTrans = transliterateDevanagari(l.Name);
+    const lNorm = normalizePhonetic(lTrans);
+    const lNormWords = lNorm.split(/\s+/).filter(w => w.length > 0);
+    
+    let score = 0;
+    
+    // Exact normalized phonetic match
+    if (lNorm === queryNorm) {
+      score += 90;
+    }
+    // Substring normalized phonetic match
+    if (lNorm.includes(queryNorm) || queryNorm.includes(lNorm)) {
+      score += 50;
+    }
+    
+    // Word overlap matching
+    queryNormWords.forEach(qw => {
+      if (lNormWords.includes(qw)) {
+        score += 15;
+      } else if (lNorm.includes(qw)) {
+        score += 8;
+      }
+    });
+    
+    return { ledger: l, score };
+  }).filter(item => item.score > 0);
+  
+  scored.sort((a, b) => b.score - a.score);
+  
+  if (scored.length === 0) {
+    return { matchedLedger: null, options: [] };
+  }
+  
+  const topScore = scored[0].score;
+  if (topScore >= 85) {
+    return { matchedLedger: scored[0].ledger, options: [] };
+  }
+  
+  const options = scored.filter(item => item.score >= Math.max(35, topScore - 15));
+  if (options.length === 1) {
+    return { matchedLedger: options[0].ledger, options: [] };
+  }
+  
+  return { matchedLedger: null, options: options.map(item => item.ledger).slice(0, 5) };
+}
+
+export async function registerMcpServer(): Promise<McpServer> {
+  const mcpServer = new McpServer({
+    name: 'Tally Prime MCP Server',
+    title: 'Tally Prime',
+    version: '7.0.0'
+  });
+
+
+  mcpServer.registerTool(
+    'metadata-collection',
+    {
+      title: 'Metadata Collection',
+      description: 'returns collections metadata with collection and description',
+      inputSchema: {},
+      annotations: {
+        readOnlyHint: true,
+        openWorldHint: false
+      }
+    },
+    async () => {
+      const collections = lstCollectionFields.map(({ collection, description }) => ({
+        collection,
+        description
+      }));
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(collections)
+          }
+        ]
+      };
+    }
+  );
+
+  mcpServer.registerTool(
+    'metadata-fields',
+    {
+      title: 'Metadata Fields',
+      description: 'returns fields metadata for the selected tally collection containing field name, optional description and data type which can be string, number, date or boolean',
+      inputSchema: {
+        collection: z.enum(lstCollections).describe('target collection to fetch field metadata')
+      },
+      annotations: {
+        readOnlyHint: true,
+        openWorldHint: false
+      }
+    },
+    async (args) => {
+      const fields = (lstCollectionFields.find(
+        (item) => item.collection === args.collection
+      )?.fields ?? []).map((field) => {
+        const lstFields = { ...field };
+
+        // substitute amount, quantity and rate data types with number data type to make it more generic since these are all numeric fields
+        if (lstFields.datatype === 'amount' || lstFields.datatype === 'quantity' || lstFields.datatype === 'rate') {
+          lstFields.datatype = 'number';
+        }
+
+        // delete property expression from field if found
+        if (lstFields.expression) {
+          delete lstFields.expression;
+        }
+
+        return lstFields;
+      });
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(fields)
+          }
+        ]
+      };
+    }
+  );
+
+  mcpServer.registerTool(
+    'query-option-values',
+    {
+      title: 'Query Option Values',
+      description: 'returns predefined option values or drop-down values for the fields required for master and voucher creation, it returns back object array of pre-defined values',
+      inputSchema: {
+        optionName: z.enum(['country-state']).describe('option name to query')
+      },
+      annotations: {
+        readOnlyHint: true,
+        openWorldHint: false
+      }
+    },
+    async (args) => {
+      let retval = undefined;
+      if (args.optionName === 'country-state') retval = lstOptionCountryState;
+      else {
+        return {
+          isError: true,
+          content: [
+            {
+              type: 'text',
+              text: 'Invalid option name'
+            }
+          ]
+        }
+      };
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(retval)
+          }
+        ]
+      };
+    }
+  );
+
+  mcpServer.registerTool(
+    'query-database',
+    {
+      title: 'Query Database',
+      description: `executes sql query on pglite postgres in-memory database for querying cached Tally Prime report data in table generated as output by other tools (in tableID property from tool output response). These tables are temporary and will be dropped after 15 minutes automatically. Use this tool to run complex analytical queries to aggregate, filter, sort results`,
+      inputSchema: {
+        sql: z.string().describe('SQL query to execute on pglite postgres in-memory database, only SELECT queries are allowed. UPDATE, DELETE, INSERT queries are not allowed for data safety'),
+        outputFormat: z.enum(['JSON Array of Objects', 'JSON with Schema and Rows', 'CSV', 'Markdown Table']).optional().describe('optional output format, default is JSON Array of Objects. JSON Array of Objects = [{"column1": "value1", "column2": "value2"}, {...}] , JSON with Schema and Rows = {"schema": ["column1", "column2"], "rows": [["value1", "value2"], [...]]}, CSV = comma separated values with header, Markdown Table = table format with header in markdown syntax which can be directly rendered in markdown supported viewers')
+      },
+      annotations: {
+        readOnlyHint: true,
+        openWorldHint: false
+      }
+    },
+    async (args) => {
+      const resp = await executeSQL(args.sql, args.outputFormat || 'JSON Array of Objects');
+      return {
+        content: [{ type: 'text', text: resp }]
+      };
+    }
+  );
+
+  mcpServer.registerTool(
+    'query-collection',
+    {
+      title: 'Query Collection',
+      description: `queries a Tally Prime collection with selected fields and optional context like target company and reporting period. result is cached in pglite postgres in-memory table and returned as tableID. Use query-database tool to run SQL queries against that table for further analysis`,
+      inputSchema: {
+        collection: z.enum(lstCollections).describe('collection name to query, validate it using metadata-collection tool with exact collection name'),
+        fields: z.array(z.string()).min(1).describe('list of field names to fetch for the selected collection. validate it using metadata-fields resource for that collection'),
+        targetCompany: z.string().optional().describe('optional company name. leave it blank or skip this to choose default company. validate it using list-master tool with collection as company if specified'),
+        fromDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().describe('optional from date'),
+        toDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().describe('optional to date')
+      },
+      annotations: {
+        readOnlyHint: true,
+        openWorldHint: false
+      }
+    },
+    async (args) => {
+      try {
+        const collection = args.collection.trim();
+
+        const requestedFields = args.fields.map((field) => field.trim());
+        const targetCollectionFields = lstCollectionFields.filter(p => p.collection == args.collection).map(p => p.fields)[0];
+
+        // Validate that every requested field exists in the collection definition
+        const validFieldNames = targetCollectionFields.map(f => f.name);
+        const invalidFields = requestedFields.filter(f => !validFieldNames.includes(f));
+        if (invalidFields.length > 0) {
+          return {
+            isError: true,
+            content: [{ type: 'text', text: `The following fields do not exist in collection '${collection}': ${invalidFields.join(', ')}. Use metadata-fields resource to get valid field names.` }]
+          };
+        }
+
+        const requestedFieldsMetadata = targetCollectionFields.filter(p => requestedFields.includes(p.name));
+
+        const fromDate = args.fromDate ? new Date(args.fromDate) : undefined;
+        const toDate = args.toDate ? new Date(args.toDate) : undefined;
+
+        const result = await queryCollection(
+          collection,
+          requestedFields,
+          new Map<string, string>(),
+          args.targetCompany,
+          fromDate,
+          toDate
+        );
+
+        // prepare Map of field name and data type for caching table metadata
+        let fieldMetadataMap = new Map<string, string>();
+        requestedFieldsMetadata.forEach((field) => {
+          if (field.datatype === 'amount' || field.datatype === 'quantity' || field.datatype === 'rate') {
+            fieldMetadataMap.set(field.name, 'number');
+          } else if (field.datatype === 'date') {
+            fieldMetadataMap.set(field.name, 'date');
+          } else if (field.datatype === 'boolean') {
+            fieldMetadataMap.set(field.name, 'boolean');
+          } else {
+            fieldMetadataMap.set(field.name, 'string');
+          }
+        });
+
+        const tableId = await cacheTable(fieldMetadataMap, result, args.collection);
+
+        return {
+          content: [{ type: 'text', text: JSON.stringify({ tableID: tableId }) }]
+        };
+      } catch (err) {
+        return {
+          isError: true,
+          content: [{ type: 'text', text: JSON.stringify(err) }]
+        };
+      }
+    }
+  );
+
+  mcpServer.registerTool(
+    'list-master',
+    {
+      title: 'List Masters',
+      description: `fetches list of masters from Tally Prime collection e.g. group, ledger, vouchertype, unit, godown, stockgroup, stockitem, costcategory, costcentre, attendancetype, company, currency, gstin, gstclassification returns output in JSON string array in the property list`,
+      inputSchema: {
+        targetCompany: z.string().optional().describe('optional company name. leave it blank or skip this to choose for default company. validate it using list-master tool with collection as company if specified'),
+        collection: z.enum(['group', 'ledger', 'vouchertype', 'unit', 'godown', 'stockgroup', 'stockitem', 'costcategory', 'costcentre', 'attendancetype', 'company', 'currency', 'gstin', 'gstclassification']),
+        containsFilter: z.string().optional().describe('optional filter to apply on name field with contains operator to filter results with respective name value or keywords, case insensitive')
+      },
+      annotations: {
+        readOnlyHint: true,
+        openWorldHint: false
+      }
+    },
+    async (args) => {
+      try {
+        let targetCollection = lstCollections.find((item) => item.toLowerCase() === args.collection.toLowerCase());
+        if (!targetCollection) {
+          return {
+            isError: true,
+            content: [{ type: 'text', text: 'Invalid collection name' }]
+          }
+        }
+        let lstFilters = new Map<string, string>();
+        if (args.containsFilter) {
+          lstFilters.set('Search_Contains', `$Name CONTAINS "${args.containsFilter.replace(/"/g, '')}"`); //ensure to strip double quotes from filter value to avoid TDL syntax error
+        }
+        let result = await queryCollection(targetCollection, ['Name'], lstFilters, args.targetCompany);
+        return {
+          content: [{ type: 'text', text: JSON.stringify({ list: result.map((item) => item.Name) }) }]
+        };
+      } catch (err) {
+        return {
+          isError: true,
+          content: [{ type: 'text', text: JSON.stringify(err) }]
+        };
+      }
+    }
+  );
+
+  mcpServer.registerTool(
+    'chart-of-accounts',
+    {
+      title: 'Chart of Accounts',
+      description: `fetches chart of accounts or GL hierarchy with fields ledger_name, group_name, primary_group, bs_pl, dr_cr, affects_gross_profit, sort_position. the column bs_pl will have values false = Balance Sheet / true = Profit Loss. Column dr_cr as value true = Debit / false = Credit. primary_group is the primary group of parent or group, under which ledger is nested. The columns group and parent are tree structure represented in flat format. The column affects_gross_profit has values true / false, it is used to determine if ledger under this group will affect gross profit or not. sort_position determines position or placement order with respect to items of same level for display, returns output cached in pglite postgres in-memory table (specified in tableID property). Use query-database tool to run SQL queries against that table for further analysis`,
+      inputSchema: {
+        targetCompany: z.string().optional().describe('optional company name. leave it blank or skip this to choose for default company. validate it using list-master tool with collection as company if specified'),
+      },
+      annotations: {
+        readOnlyHint: true,
+        openWorldHint: false
+      }
+    },
+    async (args) => {
+      try {
+        let result = await queryCollection('Ledger', ['Name', 'Parent', '_PrimaryGroup', 'IsRevenue', 'IsDeemedPositive', 'AffectsGrossProfit', 'SortPosition'], new Map<string, string>(), args.targetCompany);
+        result = renameObjectArrayProperties(result, new Map<string, string>([['Name', 'ledger_name'], ['Parent', 'group_name'], ['_PrimaryGroup', 'primary_group'], ['IsRevenue', 'bs_pl'], ['IsDeemedPositive', 'dr_cr'], ['AffectsGrossProfit', 'affects_gross_profit'], ['SortPosition', 'sort_position']]));
+        let tableID = await cacheTable(new Map<string, string>([['ledger_name', 'string'], ['group_name', 'string'], ['primary_group', 'string'], ['bs_pl', 'boolean'], ['dr_cr', 'boolean'], ['affects_gross_profit', 'boolean'], ['sort_position', 'number']]), result, 'chart-of-accounts');
+        return {
+          content: [{ type: 'text', text: JSON.stringify({ tableID }) }]
+        };
+      } catch (err) {
+        return {
+          isError: true,
+          content: [{ type: 'text', text: JSON.stringify(err) }]
+        };
+      }
+    }
+  );
+
+
+  mcpServer.registerTool(
+    'trial-balance',
+    {
+      title: 'Trial Balance',
+      description: `fetches trial balance with fields ledger_name, group_name (blank if Profit & Loss), opening_balance, net_debit, net_credit, closing_balance. opening_balance and closing_balance negative is debit and positive is credit. kindly fetch data from chart-of-accounts tool to pull group hierarchy before calling this tool. returns output cached in pglite postgres in-memory table (specified in tableID property). Use query-database tool to run SQL queries against that table for further analysis`,
+      inputSchema: {
+        targetCompany: z.string().optional().describe('optional company name. leave it blank or skip this to choose for default company. validate it using list-master tool with collection as company if specified'),
+        fromDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).describe('from or start date'),
+        toDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).describe('to or end date'),
+        group_name: z.string().optional().describe('optional group name to filter trial balance results, validate it using list-master tool with collection as group if required')
+      },
+      annotations: {
+        readOnlyHint: true,
+        openWorldHint: false
+      }
+    },
+    async (args) => {
+      try {
+        let lstFilters = new Map<string, string>();
+        if (args.group_name) {
+          lstFilters.set('Specific_Group', `$$IsEqual:$Parent:"${args.group_name}"`);
+        }
+        let result = await queryCollection('Ledger', ['Name', 'Parent', 'OpeningBalance', 'DebitTotals', 'CreditTotals', 'ClosingBalance'], lstFilters, args.targetCompany, new Date(args.fromDate), new Date(args.toDate));
+        result = renameObjectArrayProperties(result, new Map<string, string>([['Name', 'ledger_name'], ['Parent', 'group_name'], ['OpeningBalance', 'opening_balance'], ['DebitTotals', 'net_debit'], ['CreditTotals', 'net_credit'], ['ClosingBalance', 'closing_balance']]));
+        let tableID = await cacheTable(new Map<string, string>([['ledger_name', 'string'], ['group_name', 'string'], ['opening_balance', 'amount'], ['net_debit', 'amount'], ['net_credit', 'amount'], ['closing_balance', 'amount']]), result, 'trial-balance');
+        return {
+          content: [{ type: 'text', text: JSON.stringify({ tableID }) }]
+        };
+      } catch (err) {
+        return {
+          isError: true,
+          content: [{ type: 'text', text: JSON.stringify(err) }]
+        };
+      }
+    }
+  );
+
+  mcpServer.registerTool(
+    'profit-loss',
+    {
+      title: 'Profit and Loss',
+      description: `fetches profit and loss statement with fields like ledger_name, group_name, closing_balance. closing_balance negative is debit or expense and positive is credit or income. closing stock to be treated as credit, kindly fetch data from chart-of-accounts tool to pull group hierarchy before calling this tool. for detailed ledger level analysis call trial-balance tool, returns output cached in pglite postgres in-memory table (specified in tableID property). Use query-database tool to run SQL queries against that table for further analysis`,
+      inputSchema: {
+        targetCompany: z.string().optional().describe('optional company name. leave it blank or skip this to choose for default company. validate it using list-master tool with collection as company if specified'),
+        fromDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).describe('from or start date'),
+        toDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).describe('to or end date')
+      },
+      annotations: {
+        readOnlyHint: true,
+        openWorldHint: false
+      }
+    },
+    async (args) => {
+      try {
+        let result: any[] = [];
+        // ledger rows
+        let result_ledger = await queryCollection('Ledger', ['Name', 'Parent', 'ClosingBalance'], new Map<string, string>([['PL_Group', '$IsRevenue']]), args.targetCompany, new Date(args.fromDate), new Date(args.toDate));
+        result_ledger = renameObjectArrayProperties(result_ledger, new Map<string, string>([['Name', 'ledger_name'], ['Parent', 'group_name'], ['ClosingBalance', 'closing_balance']]));
+
+        // opening and closing stock row
+        let result_stock = await queryCollection('Group', ['Name', 'OpeningBalance', 'ClosingBalance'], new Map<string, string>([['StockTypeGroup', '$$IsEqual:$Name:"Stock-in-Hand"']]), args.targetCompany, new Date(args.fromDate), new Date(args.toDate));
+        if (result_stock.length > 0) {
+          result.push({
+            ledger_name: 'Opening Stock',
+            group_name: 'Stock-in-Hand',
+            closing_balance: result_stock[0].OpeningBalance
+          });
+          result.push({
+            ledger_name: 'Closing Stock',
+            group_name: 'Stock-in-Hand',
+            closing_balance: -result_stock[0].ClosingBalance
+          });
+        }
+
+        // merge ledger and stock results
+        result.push(...result_ledger);
+        let tableID = await cacheTable(new Map<string, string>([['ledger_name', 'string'], ['group_name', 'string'], ['closing_balance', 'amount']]), result, 'profit-loss');
+        return {
+          content: [{ type: 'text', text: JSON.stringify({ tableID }) }]
+        };
+      } catch (err) {
+        return {
+          isError: true,
+          content: [{ type: 'text', text: JSON.stringify(err) }]
+        };
+      }
+    }
+  );
+
+  mcpServer.registerTool(
+    'balance-sheet',
+    {
+      title: 'Balance Sheet',
+      description: `fetches balance sheet with fields like ledger_name, group_name (blank if Profit & Loss A/c), closing_balance. closing balance negative is debit or asset and positive is credit or liability. kindly fetch data from chart-of-accounts tool to pull group hierarchy before calling this tool. returns output cached in pglite postgres in-memory table (specified in tableID property). Use query-database tool to run SQL queries against that table for further analysis`,
+      inputSchema: {
+        targetCompany: z.string().optional().describe('optional company name. leave it blank or skip this to choose for default company. validate it using list-master tool with collection as company if specified'),
+        fromDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).describe('period start or from date'),
+        toDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).describe('period end or to date')
+      },
+      annotations: {
+        readOnlyHint: true,
+        openWorldHint: false
+      }
+    },
+    async (args) => {
+      try {
+        let result: any[] = [];
+        // ledger rows
+        let result_ledger = await queryCollection('Ledger', ['Name', 'Parent', 'ClosingBalance'], new Map<string, string>([['BS_Group', 'NOT $IsRevenue'], ['Excl_Stock', 'NOT $$IsGroupStock']]), args.targetCompany, new Date(args.fromDate), new Date(args.toDate));
+        result_ledger = renameObjectArrayProperties(result_ledger, new Map<string, string>([['Name', 'ledger_name'], ['Parent', 'group_name'], ['ClosingBalance', 'closing_balance']]));
+        result.push(...result_ledger);
+
+        // closing stock row
+        let result_stock = await queryCollection('Group', ['Name', 'ClosingBalance'], new Map<string, string>([['StockTypeGroup', '$$IsEqual:$Name:"Stock-in-Hand"']]), args.targetCompany, new Date(args.fromDate), new Date(args.toDate));
+        if (result_stock.length > 0) {
+          result.push({
+            ledger_name: 'Closing Stock',
+            group_name: 'Stock-in-Hand',
+            closing_balance: result_stock[0].ClosingBalance
+          });
+        }
+
+        // profit loss row
+        let result_pl = await queryCollection('Ledger', ['ClosingBalance'], new Map<string, string>([['PL_Ledger', '$$IsEqual:$Name:"Profit & Loss A/c"']]), args.targetCompany, new Date(args.fromDate), new Date(args.toDate));
+        if (result_pl.length > 0) {
+          result.push({
+            ledger_name: 'Profit & Loss A/c',
+            group_name: '',
+            closing_balance: result_pl[0].ClosingBalance
+          });
+        }
+
+        let tableID = await cacheTable(new Map<string, string>([['ledger_name', 'string'], ['group_name', 'string'], ['closing_balance', 'amount']]), result, 'balance-sheet');
+        return {
+          content: [{ type: 'text', text: JSON.stringify({ tableID }) }]
+        };
+      } catch (err) {
+        return {
+          isError: true,
+          content: [{ type: 'text', text: JSON.stringify(err) }]
+        };
+      }
+    }
+  );
+
+  mcpServer.registerTool(
+    'stock-summary',
+    {
+      title: 'Stock Summary',
+      description: `fetches stock item summary with fields stock_item_name, stock_group_name, opening_quantity, opening_value, inward_quantity, inward_value, outward_quantity, outward_value, closing_quantity, closing_value, returns output cached in pglite postgres in-memory table (specified in tableID property). synonyms (name=stock item / parent=stock group) Use query-database tool to run SQL queries against that table for further analysis`,
+      inputSchema: {
+        targetCompany: z.string().optional().describe('optional company name. leave it blank or skip this to choose for default company. validate it using list-master tool with collection as company if specified'),
+        fromDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).describe('period start or from date'),
+        toDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).describe('period end or to date'),
+        stockGroup: z.string().optional().describe('optional stock group name to filter stock summary results, validate it using list-master tool with collection as stock group if required')
+      },
+      annotations: {
+        readOnlyHint: true,
+        openWorldHint: false
+      }
+    },
+    async (args) => {
+      try {
+        let lstFilters = new Map<string, string>();
+        if (args.stockGroup) {
+          lstFilters.set('Specific_StockGroup', `$$IsEqual:$Parent:"${args.stockGroup.replace(/"/g, '""')}"`);
+        }
+        let result = await queryCollection('StockItem', ['Name', 'Parent', 'OpeningBalance', 'OpeningValue', 'InwardQuantity', 'InwardValue', 'OutwardQuantity', 'OutwardValue', 'ClosingBalance', 'ClosingValue', 'AffectsGrossProfit', 'SortPosition'], lstFilters, args.targetCompany, new Date(args.fromDate), new Date(args.toDate));
+        result = renameObjectArrayProperties(result, new Map<string, string>([['Name', 'stock_item_name'], ['Parent', 'stock_group_name'], ['OpeningBalance', 'opening_quantity'], ['OpeningValue', 'opening_value'], ['InwardQuantity', 'inward_quantity'], ['InwardValue', 'inward_value'], ['OutwardQuantity', 'outward_quantity'], ['OutwardValue', 'outward_value'], ['ClosingBalance', 'closing_quantity'], ['ClosingValue', 'closing_value']]));
+        let tableID = await cacheTable(new Map<string, string>([['stock_item_name', 'string'], ['stock_group_name', 'string'], ['opening_quantity', 'number'], ['opening_value', 'number'], ['inward_quantity', 'number'], ['inward_value', 'number'], ['outward_quantity', 'number'], ['outward_value', 'number'], ['closing_quantity', 'number'], ['closing_value', 'number']]), result, 'stock-summary');
+        return {
+          content: [{ type: 'text', text: JSON.stringify({ tableID }) }]
+        };
+      } catch (err) {
+        return {
+          isError: true,
+          content: [{ type: 'text', text: JSON.stringify(err) }]
+        };
+      }
+    }
+  );
+
+  mcpServer.registerTool(
+    'ledger-balance',
+    {
+      title: 'Ledger Balance',
+      description: `fetches ledger closing balance as on date, negative is debit and positive is credit, display Dr for Debit or Cr for Credit after the amount for better readability, instead of negative amount flip Debit or Credit to make it positive`,
+      inputSchema: {
+        targetCompany: z.string().optional().describe('optional company name. leave it blank or skip this to choose for default company. validate it using list-master tool with collection as company if specified'),
+        ledgerName: z.string().describe('precise ledger name, always validate it using list-master tool with collection as ledger'),
+        toDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().describe('as on date for which balance is required (defaults to current date if not provided)')
+      },
+      annotations: {
+        readOnlyHint: true,
+        openWorldHint: false
+      }
+    },
+    async (args) => {
+      try {
+        const toDateStr = args.toDate || new Date().toISOString().split('T')[0];
+        let lstFilters = new Map<string, string>([['Exact_Ledger', `$$IsEqual:$Name:"${args.ledgerName.replace(/"/g, '""')}"`]]);
+        let result = await queryCollection('Ledger', ['ClosingBalance'], lstFilters, args.targetCompany, undefined, new Date(toDateStr));
+        if (result.length > 0) {
+          return { content: [{ type: 'text', text: JSON.stringify({ amount: result[0].ClosingBalance }) }] };
+        }
+        else {
+          return { isError: true, content: [{ type: 'text', text: 'No ledger found' }] };
+        }
+      } catch (err) {
+        return {
+          isError: true,
+          content: [{ type: 'text', text: JSON.stringify(err) }]
+        };
+      }
+    }
+  );
+
+  mcpServer.registerTool(
+    'stock-item-balance',
+    {
+      title: 'Stock Item Balance',
+      description: `fetches stock item remaining quantity balance as on date, tool returns quantity and unit of measurement`,
+      inputSchema: {
+        targetCompany: z.string().optional().describe('optional company name. leave it blank or skip this to choose for default company. validate it using list-master tool with collection as company if specified'),
+        itemName: z.string().describe('precise stock item name, always validate it using list-master tool with collection as stockitem'),
+        toDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).describe('as on date for which balance is required')
+      },
+      annotations: {
+        readOnlyHint: true,
+        openWorldHint: false
+      }
+    },
+    async (args) => {
+      try {
+        let lstFilters = new Map<string, string>([['Exact_StockItem', `$$IsEqual:$Name:"${args.itemName.replace(/"/g, '""')}"`]]);
+        let result = await queryCollection('StockItem', ['ClosingBalance', 'Unit'], lstFilters, args.targetCompany, undefined, new Date(args.toDate));
+        return {
+          content: [{ type: 'text', text: JSON.stringify(result.length ? { quantity: result[0].ClosingBalance, unit_of_measurement: result[0].Unit } : '') }]
+        };
+      } catch (err) {
+        return {
+          isError: true,
+          content: [{ type: 'text', text: JSON.stringify(err) }]
+        };
+      }
+    }
+  );
+
+  mcpServer.registerTool(
+    'bills-outstanding',
+    {
+      title: 'Bills Outstanding',
+      description: `fetches pending overdue outstanding bills receivable or payable as on date with fields bill_date,reference_number,outstanding_amount,party_name,overdue_days. outstanding_amount = Debit is negative and Credit is positive. party_name = ledger_name. returns output cached in pglite postgres in-memory table (specified in tableID property). Use query-database tool to run SQL queries against that table for further analysis`,
+      inputSchema: {
+        targetCompany: z.string().optional().describe('optional company name. leave it blank or skip this to choose for default company. validate it using list-master tool with collection as company if specified'),
+        nature: z.enum(['receivable', 'payable']),
+        toDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().describe('as on date (defaults to current date if not provided)')
+      },
+      annotations: {
+        readOnlyHint: true,
+        openWorldHint: false
+      }
+    },
+    async (args) => {
+      try {
+        const toDateStr = args.toDate || new Date().toISOString().split('T')[0];
+        let lstFilters = new Map<string, string>();
+        if (args.nature) {
+          lstFilters.set('Nature', `$$IsEqual:($_PrimaryGroup:Group:($Parent:Ledger:$Parent)):"${args.nature === 'receivable' ? 'Sundry Debtors' : 'Sundry Creditors'}"`);
+        }
+        let result = await queryCollection('Bill', ['BillDate', 'Name', 'ClosingBalance', 'Parent', '_OverDueDays'], lstFilters, args.targetCompany, undefined, new Date(toDateStr));
+        result = renameObjectArrayProperties(result, new Map<string, string>([['BillDate', 'bill_date'], ['Name', 'reference_number'], ['ClosingBalance', 'outstanding_amount'], ['Parent', 'party_name'], ['_OverDueDays', 'overdue_days']]));
+        let tableID = await cacheTable(new Map<string, string>([['bill_date', 'date'], ['reference_number', 'string'], ['outstanding_amount', 'number'], ['party_name', 'string'], ['overdue_days', 'number']]), result, 'bills-outstanding');
+        return {
+          content: [{ type: 'text', text: JSON.stringify({ tableID }) }]
+        };
+      } catch (err) {
+        return {
+          isError: true,
+          content: [{ type: 'text', text: JSON.stringify(err) }]
+        };
+      }
+    }
+  );
+
+  mcpServer.registerTool(
+    'ledger-account',
+    {
+      title: 'Ledger Account',
+      description: `fetches GL ledger account statement with voucher level details containing fields guid, date, voucher_type, voucher_number, alternate_ledger, party_name, amount, narration . amount = debit is negative and credit is positive. alternate_ledger = if amount is credit then ledger by which it is debited and vice-a-versa (in case of multiple ledgers first one is displayed). returns output cached in pglite postgres in-memory table (specified in tableID property). Use query-database tool to run SQL queries against that table for further analysis`,
+      inputSchema: {
+        targetCompany: z.string().optional().describe('optional company name. leave it blank or skip this to choose for default company. validate it using list-master tool with collection as company if specified'),
+        ledgerName: z.string().describe('ledger name, always verify if ledger exists using list-master tool with collection as ledger'),
+        fromDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).describe('from or start date'),
+        toDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).describe('to or end date')
+      },
+      annotations: {
+        readOnlyHint: true,
+        openWorldHint: false
+      }
+    },
+    async (args) => {
+      let inputParams = new Map([['fromDate', args.fromDate], ['toDate', args.toDate], ['ledgerName', args.ledgerName]]);
+      if (args.targetCompany) {
+        inputParams.set('targetCompany', args.targetCompany);
+      }
+
+      // verify if ledger exists before making report call to avoid unnecessary processing and load on Tally
+      let lstLedger = await queryCollection('Ledger', ['Name'], new Map<string, string>([['Exact_Ledger', `$$IsEqual:$Name:"${args.ledgerName.replace(/"/g, '""')}"`]]), args.targetCompany);
+      if (lstLedger.length === 0) {
+        return {
+          isError: true,
+          content: [{ type: 'text', text: 'No ledger found with the given name' }]
+        };
+      }
+
+      const resp = await fetchReport('ledger-account', inputParams);
+
+      if (resp.error) {
+        return {
+          isError: true,
+          content: [{ type: 'text', text: resp.error }]
+        };
+      }
+      else {
+
+        //swap opening balance row to the top since it came at the end from Tally XML response
+        if (Array.isArray(resp.data) && resp.data.length > 0) {
+          const lastItem = resp.data.pop();
+          resp.data.unshift(lastItem);
+        }
+        const tableId = await cacheTable(new Map([['guid', 'string'], ['date', 'date'], ['voucher_type', 'string'], ['voucher_number', 'string'], ['alternate_ledger', 'string'], ['party_name', 'string'], ['amount', 'number'], ['narration', 'string']]), resp.data, 'ledger-account');
+        return {
+          content: [{ type: 'text', text: JSON.stringify({ tableID: tableId }) }]
+        };
+      }
+    }
+  );
+
+  mcpServer.registerTool(
+    'stock-item-account',
+    {
+      title: 'Stock Item Account',
+      description: `fetches GL stock item account statement with voucher level details containing fields date, voucher_type, voucher_number, party_name, quantity, amount, narration, tracking_number, voucher_category. party_name = ledger_name. quantity = inward as positive and outward as negative. amount = debit is negative and credit is positive, narration = notes / remarks. for calculating closing balance of quantity, consider rows with tracking_number as empty as it is, but for rows with tracking_number having text value, then duplicate rows need to be removed by preparing intermediate output with aggregation of tracking_number and voucher_category with sum of quantity and then comparing quantity of Receipt Note with Purchase and Delivery Note with Sales to identify and remove the rows with Receipt Note and Delivery Note if they are found to be tracked fully / partially . returns output cached in pglite postgres in-memory table (specified in tableID property). Use query-database tool to run SQL queries against that table for further analysis`,
+      inputSchema: {
+        targetCompany: z.string().optional().describe('optional company name. leave it blank or skip this to choose for default company. validate it using list-master tool with collection as company if specified'),
+        itemName: z.string().describe('stock item name, validate it using list-master tool with collection as stockitem'),
+        fromDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).describe('from or start date'),
+        toDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).describe('to or end date')
+      },
+      annotations: {
+        readOnlyHint: true,
+        openWorldHint: false
+      }
+    },
+    async (args) => {
+      let inputParams = new Map([['fromDate', args.fromDate], ['toDate', args.toDate], ['itemName', args.itemName]]);
+      if (args.targetCompany) {
+        inputParams.set('targetCompany', args.targetCompany);
+      }
+
+      // verify if stock item exists before making report call to avoid unnecessary processing and load on Tally
+      let lstStockItem = await queryCollection('StockItem', ['Name'], new Map<string, string>([['Exact_StockItem', `$$IsEqual:$Name:"${args.itemName.replace(/"/g, '""')}"`]]), args.targetCompany);
+      if (lstStockItem.length === 0) {
+        return {
+          isError: true,
+          content: [{ type: 'text', text: 'No stock item found with the given name' }]
+        };
+      }
+
+      const resp = await fetchReport('stock-item-account', inputParams);
+
+      if (resp.error) {
+        return {
+          isError: true,
+          content: [{ type: 'text', text: resp.error }]
+        };
+      }
+      else {
+
+        //swap opening balance row to the top since it came at the end from Tally XML response
+        if (Array.isArray(resp.data) && resp.data.length > 0) {
+          const lastItem = resp.data.pop();
+          resp.data.unshift(lastItem);
+        }
+        const tableId = await cacheTable(new Map([['date', 'date'], ['voucher_type', 'string'], ['voucher_number', 'string'], ['party_ledger', 'string'], ['quantity', 'number'], ['amount', 'number'], ['narration', 'string'], ['tracking_number', 'string'], ['voucher_category', 'string']]), resp.data, 'stock-item-account');
+        return {
+          content: [{ type: 'text', text: JSON.stringify({ tableID: tableId }) }]
+        };
+      }
+
+    }
+  );
+
+  mcpServer.registerTool(
+    'ledger-create-update',
+    {
+      title: 'Create or Update Ledger',
+      description: `create or update ledger master data in Tally Prime, returns success count of created and / or altered records`,
+      inputSchema: {
+        targetCompany: z.string().optional().describe('optional company name. leave it blank or skip this to choose for default company. validate it using list-master tool with collection as company if specified'),
+        masters: z.array(z.object({
+          name: z.string().describe('ledger name or updated ledger name for modify / update'),
+          _name: z.string().optional().describe('old ledger name to modify / update, validate if ledger exists using list-master tool with collection as ledger'),
+          parent: z.string().optional().describe('group name for the ledger, validate if group exists using list-master tool with collection as group'),
+          openingBalance: z.number().optional().describe('optional opening balance for the ledger debit is negative and credit is positive'),
+          isBillWise: z.boolean().optional().describe('optional billwise or bill by bill tracking is enabled for the ledger, default is false, set it undefined to keep it unchanged'),
+          billCreditPeriod: z.number().optional().describe('optional bill credit period in number of days, applicable only if isBillWise is true, set it undefined to keep it unchanged'),
+          mailingDetails: z.object({
+            name: z.string().optional().describe('business name for mailing details, set it undefined to keep it unchanged, set it blank to reset it to Not Applicable'),
+            country: z.string().describe('country for mailing details, validate it using query-option-values tool with input optionName as country-state, set it blank to reset it to Not Applicable'),
+            state: z.string().describe('state for mailing details, validate it using query-option-values tool with input optionName as country-state, set it blank to reset it to Not Applicable'),
+            address: z.string().optional().describe('address for mailing details, set it blank to reset it'),
+            pincode: z.string().regex(/^\d{6}$/).optional().describe('pincode for mailing details 6 digit number, set it blank to reset it, set it undefined to keep it unchanged'),
+          }).optional().describe('optional mailing details for the ledger'),
+          gstRegistrationDetails: z.object({
+            gstin: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).describe('GSTIN or GST number'),
+            registrationType: z.enum(['Composition', 'Regular', 'Unregistered/Consumer', 'Government entity / TDS', 'Regular - SEZ', 'Regular-Deemed Exporter', 'Regular-Exports (EOU)', 'e-Commerce Operator', 'Input Service Distributor', 'Embassy/UN Body', 'Non-Resident Taxpayer']).optional().describe('GST registration type'),
+            placeOfSupply: z.string().optional().describe('place of supply for GST, validate it using query-option-values tool with input optionName as country-state with value of state property, set it blank to reset it to Not Applicable, set it undefined to keep it unchanged'),
+          }).optional().describe('optional GST registration details for the ledger, applicable only if country in mailing details is India'),
+        })).describe('array of master data objects to create or update'),
+      },
+      annotations: {
+        readOnlyHint: false,
+        openWorldHint: false,
+        destructiveHint: true,
+        idempotentHint: true
+      }
+    },
+    async (args) => {
+      try {
+        if (Array.isArray(args.masters) && args.masters.length > 0) {
+          let objMasterInput: Map<string, any> = new Map();
+          let lstObjMasters: any[] = [];
+
+          // assign books begin from date by calling queryCollection
+          let booksBeginFrom = new Date();
+          const resultBooksBeginFrom = await queryCollection('Company', ['Name', 'BooksFrom', 'IsActiveCompany'], new Map<string, string>());
+
+          if (resultBooksBeginFrom.length === 0) {
+            return {
+              isError: true,
+              content: [{ type: 'text', text: 'No company found to determine books begin from date' }]
+            }
+          }
+
+          if (!args.targetCompany) { //choose Active company
+            booksBeginFrom = resultBooksBeginFrom.filter((item) => item.IsActiveCompany)[0].BooksFrom;
+          } else { //choose specified target company
+            booksBeginFrom = resultBooksBeginFrom.filter((item) => item.Name === args.targetCompany)[0].BooksFrom;
+          }
+
+          args.masters.forEach((master) => {
+            let objLedger: any = {};
+            if (master._name) objLedger._name = master._name;
+            if (master.name) objLedger.name = master.name;
+            if (master.parent) objLedger.parent = master.parent;
+            if (master.openingBalance !== undefined) objLedger.openingBalance = master.openingBalance;
+            if (master.mailingDetails) {
+              objLedger.mailingDetails = master.mailingDetails;
+              objLedger.mailingDetails.applicableFrom = booksBeginFrom;
+            }
+            if (master.gstRegistrationDetails) {
+              objLedger.gstRegistrationDetails = master.gstRegistrationDetails;
+              objLedger.gstRegistrationDetails.applicableFrom = booksBeginFrom;
+            }
+            if (master.isBillWise !== undefined) {
+              objLedger.isBillWise = master.isBillWise;
+            }
+            if (master.isBillWise === true && master.billCreditPeriod !== undefined && typeof master.billCreditPeriod === 'number') {
+              let creditDays = Math.trunc(master.billCreditPeriod);
+              objLedger.billCreditPeriod = creditDays;
+            }
+            lstObjMasters.push(objLedger);
+          });
+
+          objMasterInput.set('masters', lstObjMasters);
+
+          if (args.targetCompany) {
+            objMasterInput.set('targetCompany', args.targetCompany);
+          }
+
+          let result = await importMasters('master-ledger', objMasterInput);
+
+          return {
+            content: [{ type: 'text', text: JSON.stringify(result) }]
+          }
+        } else {
+          return {
+            isError: true,
+            content: [{ type: 'text', text: 'masters array is required with at least one master object to create or update' }]
+          }
+        }
+      } catch (err) {
+        return {
+          isError: true,
+          content: [{ type: 'text', text: JSON.stringify(err) }]
+        };
+      }
+
+    }
+  );
+
+  mcpServer.registerTool(
+    'set-company',
+    {
+      title: 'Set Company',
+      description: `sets the active company context in Tally Prime. This changes the global company context used by Tally for subsequent operations and report queries`,
+      inputSchema: {
+        companyName: z.string().describe('company name to set as active, validate it using list-master tool with collection as company')
+      },
+      annotations: {
+        readOnlyHint: true,
+        openWorldHint: false
+      }
+    },
+    async (args) => {
+      try {
+        let inputParams = new Map([['SVCurrentCompany', utility.String.escapeHTML(args.companyName)]]);
+        await invokeTallyAction('ChangeCurrentCompany', inputParams);
+        return { content: [{ type: 'text', text: JSON.stringify('OK') }] };
+      } catch (err) {
+        return {
+          isError: true, content: [{ type: 'text', text: JSON.stringify(err) }]
+        };
+      }
+
+    }
+  );
+
+  mcpServer.registerTool(
+    'set-period',
+    {
+      title: 'Set Period',
+      description: `sets the active reporting period in Tally Prime by specifying a from date and to date. This changes the global period context used by Tally for subsequent report queries`,
+      inputSchema: {
+        fromDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).describe('start date of the period'),
+        toDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).describe('end date of the period')
+      },
+      annotations: {
+        readOnlyHint: true,
+        openWorldHint: false
+      }
+    },
+    async (args) => {
+      try {
+        let _fromDate = new Date(args.fromDate);
+        let _toDate = new Date(args.toDate);
+        let inputParams = new Map([['SVFromDate', utility.Date.format(_fromDate, 'd-MMM-yyyy')], ['SVToDate', utility.Date.format(_toDate, 'd-MMM-yyyy')]]);
+        await invokeTallyAction('Change Period', inputParams);
+        return { content: [{ type: 'text', text: JSON.stringify('OK') }] };
+      } catch (err) {
+        return {
+          isError: true, content: [{ type: 'text', text: JSON.stringify(err) }]
+        };
+      }
+    }
+  );
+
+  mcpServer.registerTool(
+    'pipeline-outstanding-balance',
+    {
+      title: 'Pipeline - Outstanding Balance',
+      description: 'Instantly fetches the total outstanding balance for a given ledger name (case-insensitive) across all bills. Avoids multiple MCP calls.',
+      inputSchema: {
+        ledgerName: z.string().describe('The name of the ledger (e.g. Vansh Textile). Partial match is allowed.'),
+        nature: z.enum(['receivable', 'payable']).describe('Receivable (Debtors) or Payable (Creditors)'),
+        toDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().describe('As on date (defaults to current date if not provided)')
+      }
+    },
+    async (args) => {
+        try {
+            const toDateStr = args.toDate || new Date().toISOString().split('T')[0];
+            let lstLedger = await queryCollection('Ledger', ['Name', 'Parent', 'LedgerMobile', 'Address'], new Map(), undefined);
+            const { matchedLedger, options } = resolveLedgerName(args.ledgerName, lstLedger);
+            if (!matchedLedger) {
+                if (options.length === 0) {
+                    return { content: [{ type: 'text', text: `No ledger found matching: ${args.ledgerName}` }] };
+                } else {
+                    let topOptions = options.map(m => `"${m.Name}"`).join(', ');
+                    return { content: [{ type: 'text', text: `AMBIGUOUS MATCH: Multiple ledgers found. You MUST ask the user to clarify using this exact syntax at the end of your response: [OPTIONS: ${topOptions}]` }] };
+                }
+            }
+            const exactLedgerName = matchedLedger.Name;
+            const ledgerMobile = matchedLedger.LedgerMobile || '';
+            const ledgerAddress = matchedLedger.Address || '';
+
+            let lstFilters = new Map<string, string>();
+            lstFilters.set('Nature', `$$IsEqual:($_PrimaryGroup:Group:($Parent:Ledger:$Parent)):"${args.nature === 'receivable' ? 'Sundry Debtors' : 'Sundry Creditors'}"`);
+            
+            let result = await queryCollection('Bill', ['BillDate', 'Name', 'ClosingBalance', 'Parent', '_OverDueDays'], lstFilters, undefined, undefined, new Date(toDateStr));
+            let targetBills = result.filter(b => b.Parent.toLowerCase() === exactLedgerName.toLowerCase());
+            
+            if (targetBills.length > 0) {
+                // calculate sum of closing amounts
+                let totalAmount = targetBills.reduce((sum: number, bill: any) => sum + (bill.ClosingBalance || 0), 0);
+                
+                // create markdown summary
+                let mdText = `**Outstanding Balance for ${exactLedgerName}**\n`;
+                if (ledgerMobile) mdText += `Mobile: ${ledgerMobile}\n`;
+                if (ledgerAddress) mdText += `Address: ${ledgerAddress}\n`;
+                mdText += `\nTotal Outstanding: **${formatCurrency(Math.abs(totalAmount))} ${totalAmount < 0 ? 'Dr' : 'Cr'}**\n\n`;
+                mdText += `*Breakdown by Bills:*\n`;
+                targetBills.forEach((bill: any) => {
+                    const formattedDate = formatDateDisplay(bill.BillDate);
+                    mdText += `- Bill **${bill.Name}** (${formattedDate}): ${formatCurrency(Math.abs(bill.ClosingBalance))} ${bill.ClosingBalance < 0 ? 'Dr' : 'Cr'}\n`;
+                });
+                return { content: [{ type: 'text', text: mdText }] };
+            } else {
+                let fallbackMsg = `There are no outstanding bills for ${exactLedgerName} as of ${toDateStr}.\n`;
+                if (ledgerMobile) fallbackMsg += `Mobile: ${ledgerMobile}\n`;
+                if (ledgerAddress) fallbackMsg += `Address: ${ledgerAddress}\n`;
+                
+                try {
+                    let balFilters = new Map<string, string>([['Exact_Ledger', `$$IsEqual:$Name:"${exactLedgerName.replace(/"/g, '""')}"`]]);
+                    let balDate = new Date(toDateStr);
+                    let balResult = await queryCollection('Ledger', ['ClosingBalance'], balFilters, undefined, undefined, balDate);
+                    if (balResult.length > 0 && balResult[0].ClosingBalance !== undefined) {
+                        let amt = balResult[0].ClosingBalance;
+                        if (amt !== 0) {
+                            if (amt < 0) {
+                                try {
+                                    const toDateObj = new Date(toDateStr);
+                                    const oneYearAgo = new Date(toDateObj);
+                                    oneYearAgo.setFullYear(oneYearAgo.getFullYear() - 1);
+                                    const fromDateStr = oneYearAgo.toISOString().split('T')[0];
+
+                                    let inputParams = new Map([
+                                        ['fromDate', fromDateStr],
+                                        ['toDate', toDateStr],
+                                        ['ledgerName', exactLedgerName]
+                                    ]);
+                                    
+                                    const accResp = await fetchReport('ledger-account', inputParams);
+                                    if (!accResp.error && Array.isArray(accResp.data)) {
+                                        const pendingInvoices = calculateFIFO(accResp.data);
+                                        if (pendingInvoices.length > 0) {
+                                            let mdText = `**Outstanding Balance for ${exactLedgerName} (FIFO Allocation)**\n`;
+                                            if (ledgerMobile) mdText += `Mobile: ${ledgerMobile}\n`;
+                                            if (ledgerAddress) mdText += `Address: ${ledgerAddress}\n`;
+                                            
+                                            const totalPending = pendingInvoices.reduce((sum, inv) => sum + inv.pending_amount, 0);
+                                            mdText += `\nTotal Outstanding (FIFO): **${formatCurrency(totalPending)} Dr** (Overall Ledger Balance: **${formatCurrency(Math.abs(amt))} Dr**)\n\n`;
+                                            mdText += `*Breakdown by calculated pending bills:*\n`;
+                                            pendingInvoices.forEach((inv) => {
+                                                const formattedDate = formatDateDisplay(inv.date);
+                                                mdText += `- Bill **${inv.voucher_number}** (${formattedDate}): ${formatCurrency(inv.pending_amount)} Dr [${inv.days_old} दिन पुराना]\n`;
+                                            });
+                                            return { content: [{ type: 'text', text: mdText }] };
+                                        }
+                                    }
+                                } catch (fifoErr) {
+                                    // Ignore FIFO error and fallback
+                                }
+                            }
+                            fallbackMsg += `\nHowever, the overall ledger balance is **${formatCurrency(Math.abs(amt))} ${amt < 0 ? 'Dr' : 'Cr'}**.`;
+                        }
+                    }
+                } catch (e) {
+                    // Ignore balance fetch errors
+                }
+
+                return { content: [{ type: 'text', text: fallbackMsg }] };
+            }
+        } catch (err) {
+            return { isError: true, content: [{ type: 'text', text: JSON.stringify(err) }] };
+        }
+    }
+  );
+
+  mcpServer.registerTool(
+    'pipeline-ledger-statement',
+    {
+      title: 'Pipeline - Generate Ledger Statement PDF',
+      description: 'Generates a PDF ledger statement in a single call. Resolves the exact ledger name, fetches balances and transactions, and generates the PDF natively.',
+      inputSchema: {
+        ledgerName: z.string().describe('The name of the ledger (e.g. Vansh Textile)'),
+        fromDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+        toDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/)
+      }
+    },
+    async (args) => {
+        try {
+            let lstLedger = await queryCollection('Ledger', ['Name', 'Parent'], new Map(), undefined);
+            const { matchedLedger, options } = resolveLedgerName(args.ledgerName, lstLedger);
+            if (!matchedLedger) {
+                if (options.length === 0) {
+                    return { content: [{ type: 'text', text: `No ledger found matching: ${args.ledgerName}` }] };
+                } else {
+                    let topOptions = options.map(m => `"${m.Name}"`).join(', ');
+                    return { content: [{ type: 'text', text: `AMBIGUOUS MATCH: Multiple ledgers found. You MUST ask the user to clarify using this exact syntax at the end of your response: [OPTIONS: ${topOptions}]` }] };
+                }
+            }
+            const exactLedgerName = matchedLedger.Name;
+
+            let fullLedgerData = await queryCollection('Ledger', ['Name', 'Parent', 'LedgerMobile', 'Address'], new Map<string, string>([['Exact_Ledger', `$$IsEqual:$Name:"${exactLedgerName.replace(/"/g, '""')}"`]]), undefined);
+            let ledgerMobile = '';
+            let ledgerAddress = '';
+            if (fullLedgerData.length > 0) {
+                ledgerMobile = fullLedgerData[0].LedgerMobile || '';
+                ledgerAddress = fullLedgerData[0].Address || '';
+            }
+
+            let inputParams = new Map([['fromDate', args.fromDate], ['toDate', args.toDate], ['ledgerName', exactLedgerName]]);
+            
+            const accResp = await fetchReport('ledger-account', inputParams);
+            let transactions = [];
+            let openingBalance = 0; 
+            let closingBalance = 0;
+
+            if (!accResp.error && Array.isArray(accResp.data)) {
+                 if (accResp.data.length > 0) {
+                    const lastItem = accResp.data.pop();
+                    accResp.data.unshift(lastItem);
+                 }
+                 transactions = accResp.data;
+
+                 const openingRow = transactions.find((t: any) => t.voucher_type === 'Opening' || t.voucher_type === 'Opening Balance');
+                 if (openingRow) {
+                     openingBalance = openingRow.amount || 0;
+                 }
+                 closingBalance = transactions.reduce((sum: number, t: any) => sum + (t.amount || 0), 0);
+            }
+
+            const jsonPayload = {
+                ledgerName: exactLedgerName,
+                ledgerMobile: ledgerMobile,
+                ledgerAddress: ledgerAddress,
+                fromDate: args.fromDate,
+                toDate: args.toDate,
+                openingBalance: openingBalance,
+                closingBalance: closingBalance,
+                transactions: transactions
+            };
+
+            const randomId = Math.random().toString(36).substring(7);
+            const jsonFilePath = path.resolve(`temp_${randomId}.json`);
+            await fs.writeFile(jsonFilePath, JSON.stringify(jsonPayload));
+
+            const scriptPath = path.resolve('scripts/ledger_pdf.py');
+            const pdfFilePath = path.resolve(`statement_${randomId}.pdf`);
+            const cmd = `python "${scriptPath}" "${pdfFilePath}" < "${jsonFilePath}"`;
+            
+            const { stdout, stderr } = await execAsync(cmd);
+            await fs.unlink(jsonFilePath).catch(()=>{});
+
+            const pdfMatch = stdout.match(/SUCCESS: (.+)/);
+            if (pdfMatch && pdfMatch[1]) {
+                const finalPdfPath = pdfMatch[1].trim();
+                return { content: [{ type: 'text', text: `PDF generated instantly at: ${finalPdfPath}\n\nSummary:\nLedger: ${exactLedgerName}\nMobile: ${ledgerMobile}\nAddress: ${ledgerAddress}\nOpening: ${openingBalance}\nClosing: ${closingBalance}` }] };
+            } else {
+                return { content: [{ type: 'text', text: `Failed to generate PDF. Output: ${stdout} ${stderr}` }] };
+            }
+
+        } catch (err) {
+            return { isError: true, content: [{ type: 'text', text: JSON.stringify(err) }] };
+        }
+    }
+  );
+
+  mcpServer.registerTool(
+    'search-ledgers',
+    {
+      title: 'Search Ledgers',
+      description: `Search for Tally ledgers by a partial name to get their precise Tally name. Always use this before creating vouchers to avoid precise-name exceptions.`,
+      inputSchema: {
+        targetCompany: z.string().optional().describe('optional company name'),
+        query: z.string().describe('partial name of the ledger to search for')
+      },
+      annotations: { readOnlyHint: true, openWorldHint: false }
+    },
+    async (args) => {
+      try {
+        // Local transliteration mapper for Devanagari to Hinglish (Roman) script
+        const transliterateDevanagari = (text: string): string => {
+          if (!text) return '';
+          const mapping: Record<string, string> = {
+            'अ': 'a', 'आ': 'a', 'इ': 'i', 'ई': 'ee', 'उ': 'u', 'ऊ': 'oo', 'ऋ': 'ri',
+            'ए': 'e', 'ऐ': 'ai', 'ओ': 'o', 'औ': 'au', 'अं': 'an', 'अः': 'ah',
+            'ा': 'a', 'ि': 'i', 'ी': 'ee', 'ु': 'u', 'ू': 'oo', 'े': 'e', 'ै': 'ai',
+            'ो': 'o', 'ौ': 'au', 'ं': 'n', 'ः': 'h', 'ॅ': 'a', 'ॉ': 'o',
+            'क': 'k', 'ख': 'kh', 'ग': 'g', 'घ': 'gh', 'ङ': 'n',
+            'च': 'ch', 'छ': 'chh', 'ज': 'j', 'झ': 'jh', 'ञ': 'n',
+            'ट': 't', 'ठ': 'th', 'ड': 'd', 'ढ': 'dh', 'ण': 'n',
+            'त': 't', 'थ': 'th', 'द': 'd', 'ध': 'dh', 'न': 'n',
+            'प': 'p', 'फ': 'ph', 'ब': 'b', 'भ': 'bh', 'म': 'm',
+            'य': 'y', 'र': 'r', 'ल': 'l', 'व': 'v', 'श': 'sh', 'ष': 'sh', 'स': 's', 'ह': 'h',
+            'क्ष': 'ksh', 'त्र': 'tr', 'ज्ञ': 'gy',
+            'श्र': 'shr', '्': '', '़': ''
+          };
+          
+          const words = text.split(/\s+/);
+          const mappedWords = words.map(word => {
+            let wordResult = '';
+            for (let i = 0; i < word.length; i++) {
+              const char = word[i];
+              const nextChar = word[i + 1];
+              
+              if (char === 'श' && nextChar === '्' && word[i + 2] === 'र') {
+                wordResult += 'shr';
+                i += 2;
+                continue;
+              }
+              
+              const mapped = mapping[char];
+              if (mapped !== undefined) {
+                wordResult += mapped;
+                
+                // Add implicit 'a' vowel sound after consonant if appropriate
+                const isConsonant = 'कखगघङचछजझञटठडढणतथदधनपफबभमयरलवशषसह'.includes(char);
+                if (isConsonant && nextChar) {
+                  const nextIsMatraOrVirama = 'ािीुूेैोौं्ॅॉ'.includes(nextChar);
+                  if (!nextIsMatraOrVirama) {
+                    wordResult += 'a';
+                  }
+                }
+              } else {
+                wordResult += char;
+              }
+            }
+            return wordResult;
+          });
+          
+          return mappedWords.join(' ').toLowerCase();
+        };
+
+        const allLedgers = await queryCollection('Ledger', ['Name', 'Parent'], new Map(), args.targetCompany);
+        
+        if (!args.query) {
+          return {
+            content: [{ type: 'text', text: JSON.stringify(allLedgers) }]
+          };
+        }
+
+        const queryClean = args.query.toLowerCase().trim();
+        const queryWords = queryClean.split(/\s+/).filter(w => w.length > 0);
+        const queryTrans = transliterateDevanagari(queryClean);
+        const queryNorm = normalizePhonetic(queryTrans);
+        const queryNormWords = queryNorm.split(/\s+/).filter(w => w.length > 0);
+
+        const scoredMatches = allLedgers.map(ledger => {
+          const ledgerNameLower = ledger.Name.toLowerCase();
+          const ledgerNameTrans = transliterateDevanagari(ledger.Name);
+          const ledgerNameNorm = normalizePhonetic(ledgerNameTrans);
+          const ledgerNameNormWords = ledgerNameNorm.split(/\s+/).filter(w => w.length > 0);
+          
+          let score = 0;
+          
+          // 1. Exact match
+          if (ledgerNameLower === queryClean) {
+            score += 100;
+          }
+          // 2. Exact transliterated match
+          if (ledgerNameTrans === queryTrans) {
+            score += 90;
+          }
+          // 3. Exact phonetic normalized match
+          if (ledgerNameNorm === queryNorm) {
+            score += 85;
+          }
+          // 4. Substring matches
+          if (ledgerNameLower.includes(queryClean)) {
+            score += 50;
+          }
+          if (ledgerNameTrans.includes(queryTrans)) {
+            score += 40;
+          }
+          if (ledgerNameNorm.includes(queryNorm) || queryNorm.includes(ledgerNameNorm)) {
+            score += 35;
+          }
+          
+          // 5. Overlapping word match
+          queryWords.forEach(qWord => {
+            if (ledgerNameLower.includes(qWord)) {
+              score += 10;
+            }
+          });
+          queryNormWords.forEach(qw => {
+            if (ledgerNameNormWords.includes(qw)) {
+              score += 15;
+            } else if (ledgerNameNorm.includes(qw)) {
+              score += 8;
+            }
+          });
+          
+          return { ledger, score };
+        }).filter(item => item.score > 0);
+        
+        // Sort matches by descending relevance score
+        scoredMatches.sort((a, b) => b.score - a.score);
+        
+        let finalResult: LedgerItem[] = [];
+        if (scoredMatches.length > 0) {
+          const topScore = scoredMatches[0].score;
+          const secondScore = scoredMatches[1] ? scoredMatches[1].score : 0;
+          
+          if (topScore >= 80 && (topScore - secondScore) >= 10) {
+            finalResult = [scoredMatches[0].ledger];
+          } else if (scoredMatches.length === 1 && topScore >= 70) {
+            finalResult = [scoredMatches[0].ledger];
+          } else {
+            finalResult = scoredMatches
+              .filter(item => item.score >= Math.max(0, topScore - 20))
+              .map(item => item.ledger)
+              .slice(0, 5);
+          }
+        }
+        
+        return {
+          content: [{ type: 'text', text: JSON.stringify(finalResult) }]
+        };
+      } catch (err) {
+        return {
+          isError: true,
+          content: [{ type: 'text', text: JSON.stringify(err) }]
+        };
+      }
+    }
+  );
+
+  mcpServer.registerTool(
+    'create-voucher',
+    {
+      title: 'Create Voucher',
+      description: `Creates a voucher in Tally (e.g. Receipt, Receipt Book, Payment, Sales) using Tally XML Import. Amount must be positive. debitLedger and creditLedger must be precise Tally names.`,
+      inputSchema: {
+        voucherType: z.string().describe('Voucher Type (e.g., Receipt, Payment, Receipt Book)'),
+        date: z.string().describe('Date in YYYYMMDD format'),
+        creditLedger: z.string().describe('Precise name of the ledger being credited (giving money)'),
+        debitLedger: z.string().describe('Precise name of the ledger being debited (receiving money)'),
+        amount: z.number().describe('Amount of the transaction (positive)'),
+        narration: z.string().optional().describe('Voucher narration'),
+        discountLedger: z.string().optional().describe('Optional name of the discount ledger (e.g. Discount Allowed)'),
+        discountAmount: z.number().optional().describe('Optional discount amount (positive)'),
+        voucherNumber: z.string().optional().describe('Optional voucher number')
+      },
+      annotations: { readOnlyHint: false, openWorldHint: false, destructiveHint: true }
+    },
+    async (args) => {
+      try {
+        const discountAmt = args.discountAmount || 0;
+        const mainAmount = args.amount;
+        const totalCredit = mainAmount + discountAmt;
+
+        let xml = `<ENVELOPE>
+    <HEADER>
+        <TALLYREQUEST>Import Data</TALLYREQUEST>
+    </HEADER>
+    <BODY>
+        <IMPORTDATA>
+            <REQUESTDESC>
+                <REPORTNAME>Vouchers</REPORTNAME>
+            </REQUESTDESC>
+            <REQUESTDATA>
+                <TALLYMESSAGE xmlns:UDF="TallyUDF">
+                    <VOUCHER VCHTYPE="${args.voucherType}" ACTION="Create">
+                        <DATE>${args.date}</DATE>
+                        <EFFECTIVEDATE>${args.date}</EFFECTIVEDATE>
+                        <VCHSTATUSDATE>${args.date}</VCHSTATUSDATE>
+                        <VOUCHERTYPENAME>${args.voucherType}</VOUCHERTYPENAME>
+                        ${args.voucherNumber ? `<VOUCHERNUMBER>${args.voucherNumber}</VOUCHERNUMBER>` : ''}
+                        <NARRATION>${args.narration || ''}</NARRATION>
+                        <ALLLEDGERENTRIES.LIST>
+                            <LEDGERNAME>${args.creditLedger}</LEDGERNAME>
+                            <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
+                            <AMOUNT>${totalCredit}</AMOUNT>
+                        </ALLLEDGERENTRIES.LIST>
+                        <ALLLEDGERENTRIES.LIST>
+                            <LEDGERNAME>${args.debitLedger}</LEDGERNAME>
+                            <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>
+                            <AMOUNT>-${mainAmount}</AMOUNT>
+                        </ALLLEDGERENTRIES.LIST>`;
+
+        if (discountAmt > 0 && args.discountLedger) {
+          xml += `
+                        <ALLLEDGERENTRIES.LIST>
+                            <LEDGERNAME>${args.discountLedger}</LEDGERNAME>
+                            <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>
+                            <AMOUNT>-${discountAmt}</AMOUNT>
+                        </ALLLEDGERENTRIES.LIST>`;
+        }
+
+        xml += `
+                    </VOUCHER>
+                </TALLYMESSAGE>
+            </REQUESTDATA>
+        </IMPORTDATA>
+    </BODY>
+</ENVELOPE>`;
+        const tallyHost = process.env.TALLY_HOST || 'localhost';
+        const tallyPort = process.env.TALLY_PORT || '9000';
+        const res = await fetch(`http://${tallyHost}:${tallyPort}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'text/xml' },
+            body: xml
+        });
+        const responseText = await res.text();
+        return {
+          content: [{ type: 'text', text: responseText }]
+        };
+      } catch (err) {
+        return { isError: true, content: [{ type: 'text', text: JSON.stringify(err) }] };
+      }
+    }
+  );
+
+  return mcpServer;
+}

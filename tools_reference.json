@@ -1,0 +1,817 @@
+[
+  {
+    "name": "metadata-collection",
+    "description": "returns collections metadata with collection and description",
+    "parameters": []
+  },
+  {
+    "name": "metadata-fields",
+    "description": "returns fields metadata for the selected tally collection containing field name, optional description and data type which can be string, number, date or boolean",
+    "parameters": [
+      {
+        "name": "collection",
+        "type": "string",
+        "description": "target collection to fetch field metadata",
+        "required": true
+      }
+    ]
+  },
+  {
+    "name": "query-option-values",
+    "description": "returns predefined option values or drop-down values for the fields required for master and voucher creation, it returns back object array of pre-defined values",
+    "parameters": [
+      {
+        "name": "optionName",
+        "type": "string",
+        "description": "option name to query",
+        "required": true
+      }
+    ]
+  },
+  {
+    "name": "query-database",
+    "description": "executes sql query on pglite postgres in-memory database for querying cached Tally Prime report data in table generated as output by other tools (in tableID property from tool output response). These tables are temporary and will be dropped after 15 minutes automatically. Use this tool to run complex analytical queries to aggregate, filter, sort results",
+    "parameters": [
+      {
+        "name": "sql",
+        "type": "string",
+        "description": "SQL query to execute on pglite postgres in-memory database, only SELECT queries are allowed. UPDATE, DELETE, INSERT queries are not allowed for data safety",
+        "required": true
+      },
+      {
+        "name": "outputFormat",
+        "type": "string",
+        "description": "optional output format, default is JSON Array of Objects. JSON Array of Objects = [{\"column1\": \"value1\", \"column2\": \"value2\"}, {...}] , JSON with Schema and Rows = {\"schema\": [\"column1\", \"column2\"], \"rows\": [[\"value1\", \"value2\"], [...]]}, CSV = comma separated values with header, Markdown Table = table format with header in markdown syntax which can be directly rendered in markdown supported viewers",
+        "required": false
+      }
+    ]
+  },
+  {
+    "name": "query-collection",
+    "description": "queries a Tally Prime collection with selected fields and optional context like target company and reporting period. result is cached in pglite postgres in-memory table and returned as tableID. Use query-database tool to run SQL queries against that table for further analysis",
+    "parameters": [
+      {
+        "name": "collection",
+        "type": "string",
+        "description": "collection name to query, validate it using metadata-collection tool with exact collection name",
+        "required": true
+      },
+      {
+        "name": "fields",
+        "type": "array",
+        "description": "list of field names to fetch for the selected collection. validate it using metadata-fields resource for that collection",
+        "required": true
+      },
+      {
+        "name": "targetCompany",
+        "type": "string",
+        "description": "optional company name. leave it blank or skip this to choose default company. validate it using list-master tool with collection as company if specified",
+        "required": false
+      },
+      {
+        "name": "fromDate",
+        "type": "string",
+        "description": "optional from date",
+        "required": false
+      },
+      {
+        "name": "toDate",
+        "type": "string",
+        "description": "optional to date",
+        "required": false
+      }
+    ]
+  },
+  {
+    "name": "list-master",
+    "description": "fetches list of masters from Tally Prime collection e.g. group, ledger, vouchertype, unit, godown, stockgroup, stockitem, costcategory, costcentre, attendancetype, company, currency, gstin, gstclassification returns output in JSON string array in the property list",
+    "parameters": [
+      {
+        "name": "targetCompany",
+        "type": "string",
+        "description": "optional company name. leave it blank or skip this to choose for default company. validate it using list-master tool with collection as company if specified",
+        "required": false
+      },
+      {
+        "name": "collection",
+        "type": "string",
+        "description": "",
+        "required": true
+      },
+      {
+        "name": "containsFilter",
+        "type": "string",
+        "description": "optional filter to apply on name field with contains operator to filter results with respective name value or keywords, case insensitive",
+        "required": false
+      }
+    ]
+  },
+  {
+    "name": "chart-of-accounts",
+    "description": "fetches chart of accounts or GL hierarchy with fields ledger_name, group_name, primary_group, bs_pl, dr_cr, affects_gross_profit, sort_position. the column bs_pl will have values false = Balance Sheet / true = Profit Loss. Column dr_cr as value true = Debit / false = Credit. primary_group is the primary group of parent or group, under which ledger is nested. The columns group and parent are tree structure represented in flat format. The column affects_gross_profit has values true / false, it is used to determine if ledger under this group will affect gross profit or not. sort_position determines position or placement order with respect to items of same level for display, returns output cached in pglite postgres in-memory table (specified in tableID property). Use query-database tool to run SQL queries against that table for further analysis",
+    "parameters": [
+      {
+        "name": "targetCompany",
+        "type": "string",
+        "description": "optional company name. leave it blank or skip this to choose for default company. validate it using list-master tool with collection as company if specified",
+        "required": false
+      }
+    ]
+  },
+  {
+    "name": "trial-balance",
+    "description": "fetches trial balance with fields ledger_name, group_name (blank if Profit & Loss), opening_balance, net_debit, net_credit, closing_balance. opening_balance and closing_balance negative is debit and positive is credit. kindly fetch data from chart-of-accounts tool to pull group hierarchy before calling this tool. returns output cached in pglite postgres in-memory table (specified in tableID property). Use query-database tool to run SQL queries against that table for further analysis",
+    "parameters": [
+      {
+        "name": "targetCompany",
+        "type": "string",
+        "description": "optional company name. leave it blank or skip this to choose for default company. validate it using list-master tool with collection as company if specified",
+        "required": false
+      },
+      {
+        "name": "fromDate",
+        "type": "string",
+        "description": "from or start date",
+        "required": true
+      },
+      {
+        "name": "toDate",
+        "type": "string",
+        "description": "to or end date",
+        "required": true
+      },
+      {
+        "name": "group_name",
+        "type": "string",
+        "description": "optional group name to filter trial balance results, validate it using list-master tool with collection as group if required",
+        "required": false
+      }
+    ]
+  },
+  {
+    "name": "profit-loss",
+    "description": "fetches profit and loss statement with fields like ledger_name, group_name, closing_balance. closing_balance negative is debit or expense and positive is credit or income. closing stock to be treated as credit, kindly fetch data from chart-of-accounts tool to pull group hierarchy before calling this tool. for detailed ledger level analysis call trial-balance tool, returns output cached in pglite postgres in-memory table (specified in tableID property). Use query-database tool to run SQL queries against that table for further analysis",
+    "parameters": [
+      {
+        "name": "targetCompany",
+        "type": "string",
+        "description": "optional company name. leave it blank or skip this to choose for default company. validate it using list-master tool with collection as company if specified",
+        "required": false
+      },
+      {
+        "name": "fromDate",
+        "type": "string",
+        "description": "from or start date",
+        "required": true
+      },
+      {
+        "name": "toDate",
+        "type": "string",
+        "description": "to or end date",
+        "required": true
+      }
+    ]
+  },
+  {
+    "name": "balance-sheet",
+    "description": "fetches balance sheet with fields like ledger_name, group_name (blank if Profit & Loss A/c), closing_balance. closing balance negative is debit or asset and positive is credit or liability. kindly fetch data from chart-of-accounts tool to pull group hierarchy before calling this tool. returns output cached in pglite postgres in-memory table (specified in tableID property). Use query-database tool to run SQL queries against that table for further analysis",
+    "parameters": [
+      {
+        "name": "targetCompany",
+        "type": "string",
+        "description": "optional company name. leave it blank or skip this to choose for default company. validate it using list-master tool with collection as company if specified",
+        "required": false
+      },
+      {
+        "name": "fromDate",
+        "type": "string",
+        "description": "period start or from date",
+        "required": true
+      },
+      {
+        "name": "toDate",
+        "type": "string",
+        "description": "period end or to date",
+        "required": true
+      }
+    ]
+  },
+  {
+    "name": "stock-summary",
+    "description": "fetches stock item summary with fields stock_item_name, stock_group_name, opening_quantity, opening_value, inward_quantity, inward_value, outward_quantity, outward_value, closing_quantity, closing_value, returns output cached in pglite postgres in-memory table (specified in tableID property). synonyms (name=stock item / parent=stock group) Use query-database tool to run SQL queries against that table for further analysis",
+    "parameters": [
+      {
+        "name": "targetCompany",
+        "type": "string",
+        "description": "optional company name. leave it blank or skip this to choose for default company. validate it using list-master tool with collection as company if specified",
+        "required": false
+      },
+      {
+        "name": "fromDate",
+        "type": "string",
+        "description": "period start or from date",
+        "required": true
+      },
+      {
+        "name": "toDate",
+        "type": "string",
+        "description": "period end or to date",
+        "required": true
+      },
+      {
+        "name": "stockGroup",
+        "type": "string",
+        "description": "optional stock group name to filter stock summary results, validate it using list-master tool with collection as stock group if required",
+        "required": false
+      }
+    ]
+  },
+  {
+    "name": "ledger-balance",
+    "description": "fetches ledger closing balance as on date, negative is debit and positive is credit, display Dr for Debit or Cr for Credit after the amount for better readability, instead of negative amount flip Debit or Credit to make it positive",
+    "parameters": [
+      {
+        "name": "targetCompany",
+        "type": "string",
+        "description": "optional company name. leave it blank or skip this to choose for default company. validate it using list-master tool with collection as company if specified",
+        "required": false
+      },
+      {
+        "name": "ledgerName",
+        "type": "string",
+        "description": "precise ledger name, always validate it using list-master tool with collection as ledger",
+        "required": true
+      },
+      {
+        "name": "toDate",
+        "type": "string",
+        "description": "as on date for which balance is required (defaults to current date if not provided)",
+        "required": false
+      }
+    ]
+  },
+  {
+    "name": "stock-item-balance",
+    "description": "fetches stock item remaining quantity balance as on date, tool returns quantity and unit of measurement",
+    "parameters": [
+      {
+        "name": "targetCompany",
+        "type": "string",
+        "description": "optional company name. leave it blank or skip this to choose for default company. validate it using list-master tool with collection as company if specified",
+        "required": false
+      },
+      {
+        "name": "itemName",
+        "type": "string",
+        "description": "precise stock item name, always validate it using list-master tool with collection as stockitem",
+        "required": true
+      },
+      {
+        "name": "toDate",
+        "type": "string",
+        "description": "as on date for which balance is required",
+        "required": true
+      }
+    ]
+  },
+  {
+    "name": "bills-outstanding",
+    "description": "fetches pending overdue outstanding bills receivable or payable as on date with fields bill_date,reference_number,outstanding_amount,party_name,overdue_days. outstanding_amount = Debit is negative and Credit is positive. party_name = ledger_name. returns output cached in pglite postgres in-memory table (specified in tableID property). Use query-database tool to run SQL queries against that table for further analysis",
+    "parameters": [
+      {
+        "name": "targetCompany",
+        "type": "string",
+        "description": "optional company name. leave it blank or skip this to choose for default company. validate it using list-master tool with collection as company if specified",
+        "required": false
+      },
+      {
+        "name": "nature",
+        "type": "string",
+        "description": "",
+        "required": true
+      },
+      {
+        "name": "toDate",
+        "type": "string",
+        "description": "as on date (defaults to current date if not provided)",
+        "required": false
+      }
+    ]
+  },
+  {
+    "name": "ledger-account",
+    "description": "fetches GL ledger account statement with voucher level details containing fields guid, date, voucher_type, voucher_number, alternate_ledger, party_name, amount, narration . amount = debit is negative and credit is positive. alternate_ledger = if amount is credit then ledger by which it is debited and vice-a-versa (in case of multiple ledgers first one is displayed). returns output cached in pglite postgres in-memory table (specified in tableID property). Use query-database tool to run SQL queries against that table for further analysis",
+    "parameters": [
+      {
+        "name": "targetCompany",
+        "type": "string",
+        "description": "optional company name. leave it blank or skip this to choose for default company. validate it using list-master tool with collection as company if specified",
+        "required": false
+      },
+      {
+        "name": "ledgerName",
+        "type": "string",
+        "description": "ledger name, always verify if ledger exists using list-master tool with collection as ledger",
+        "required": true
+      },
+      {
+        "name": "fromDate",
+        "type": "string",
+        "description": "from or start date",
+        "required": true
+      },
+      {
+        "name": "toDate",
+        "type": "string",
+        "description": "to or end date",
+        "required": true
+      }
+    ]
+  },
+  {
+    "name": "stock-item-account",
+    "description": "fetches GL stock item account statement with voucher level details containing fields date, voucher_type, voucher_number, party_name, quantity, amount, narration, tracking_number, voucher_category. party_name = ledger_name. quantity = inward as positive and outward as negative. amount = debit is negative and credit is positive, narration = notes / remarks. for calculating closing balance of quantity, consider rows with tracking_number as empty as it is, but for rows with tracking_number having text value, then duplicate rows need to be removed by preparing intermediate output with aggregation of tracking_number and voucher_category with sum of quantity and then comparing quantity of Receipt Note with Purchase and Delivery Note with Sales to identify and remove the rows with Receipt Note and Delivery Note if they are found to be tracked fully / partially . returns output cached in pglite postgres in-memory table (specified in tableID property). Use query-database tool to run SQL queries against that table for further analysis",
+    "parameters": [
+      {
+        "name": "targetCompany",
+        "type": "string",
+        "description": "optional company name. leave it blank or skip this to choose for default company. validate it using list-master tool with collection as company if specified",
+        "required": false
+      },
+      {
+        "name": "itemName",
+        "type": "string",
+        "description": "stock item name, validate it using list-master tool with collection as stockitem",
+        "required": true
+      },
+      {
+        "name": "fromDate",
+        "type": "string",
+        "description": "from or start date",
+        "required": true
+      },
+      {
+        "name": "toDate",
+        "type": "string",
+        "description": "to or end date",
+        "required": true
+      }
+    ]
+  },
+  {
+    "name": "ledger-create-update",
+    "description": "create or update ledger master data in Tally Prime, returns success count of created and / or altered records",
+    "parameters": [
+      {
+        "name": "targetCompany",
+        "type": "string",
+        "description": "optional company name. leave it blank or skip this to choose for default company. validate it using list-master tool with collection as company if specified",
+        "required": false
+      },
+      {
+        "name": "masters",
+        "type": "array",
+        "description": "array of master data objects to create or update",
+        "required": true
+      }
+    ]
+  },
+  {
+    "name": "set-company",
+    "description": "sets the active company context in Tally Prime. This changes the global company context used by Tally for subsequent operations and report queries",
+    "parameters": [
+      {
+        "name": "companyName",
+        "type": "string",
+        "description": "company name to set as active, validate it using list-master tool with collection as company",
+        "required": true
+      }
+    ]
+  },
+  {
+    "name": "set-period",
+    "description": "sets the active reporting period in Tally Prime by specifying a from date and to date. This changes the global period context used by Tally for subsequent report queries",
+    "parameters": [
+      {
+        "name": "fromDate",
+        "type": "string",
+        "description": "start date of the period",
+        "required": true
+      },
+      {
+        "name": "toDate",
+        "type": "string",
+        "description": "end date of the period",
+        "required": true
+      }
+    ]
+  },
+  {
+    "name": "pipeline-outstanding-balance",
+    "description": "Instantly fetches the total outstanding balance for a given ledger name (case-insensitive) across all bills. Avoids multiple MCP calls.",
+    "parameters": [
+      {
+        "name": "ledgerName",
+        "type": "string",
+        "description": "The name of the ledger (e.g. Vansh Textile). Partial match is allowed.",
+        "required": true
+      },
+      {
+        "name": "nature",
+        "type": "string",
+        "description": "Receivable (Debtors) or Payable (Creditors)",
+        "required": true
+      },
+      {
+        "name": "toDate",
+        "type": "string",
+        "description": "As on date (defaults to current date if not provided)",
+        "required": false
+      }
+    ]
+  },
+  {
+    "name": "pipeline-ledger-statement",
+    "description": "Generates a PDF ledger statement in a single call. Resolves the exact ledger name, fetches balances and transactions, and generates the PDF natively.",
+    "parameters": [
+      {
+        "name": "ledgerName",
+        "type": "string",
+        "description": "The name of the ledger (e.g. Vansh Textile)",
+        "required": true
+      },
+      {
+        "name": "fromDate",
+        "type": "string",
+        "description": "",
+        "required": true
+      },
+      {
+        "name": "toDate",
+        "type": "string",
+        "description": "",
+        "required": true
+      }
+    ]
+  },
+  {
+    "name": "search-ledgers",
+    "description": "Search for Tally ledgers by a partial name to get their precise Tally name. Always use this before creating vouchers to avoid precise-name exceptions.",
+    "parameters": [
+      {
+        "name": "targetCompany",
+        "type": "string",
+        "description": "optional company name",
+        "required": false
+      },
+      {
+        "name": "query",
+        "type": "string",
+        "description": "partial name of the ledger to search for",
+        "required": true
+      }
+    ]
+  },
+  {
+    "name": "create-voucher",
+    "description": "Creates a voucher in Tally (e.g. Receipt, Receipt Book, Payment, Sales) using Tally XML Import. Amount must be positive. debitLedger and creditLedger must be precise Tally names.",
+    "parameters": [
+      {
+        "name": "voucherType",
+        "type": "string",
+        "description": "Voucher Type (e.g., Receipt, Payment, Receipt Book)",
+        "required": true
+      },
+      {
+        "name": "date",
+        "type": "string",
+        "description": "Date in YYYYMMDD format",
+        "required": true
+      },
+      {
+        "name": "creditLedger",
+        "type": "string",
+        "description": "Precise name of the ledger being credited (giving money)",
+        "required": true
+      },
+      {
+        "name": "debitLedger",
+        "type": "string",
+        "description": "Precise name of the ledger being debited (receiving money)",
+        "required": true
+      },
+      {
+        "name": "amount",
+        "type": "number",
+        "description": "Amount of the transaction (positive)",
+        "required": true
+      },
+      {
+        "name": "narration",
+        "type": "string",
+        "description": "Voucher narration",
+        "required": false
+      },
+      {
+        "name": "discountLedger",
+        "type": "string",
+        "description": "Optional name of the discount ledger (e.g. Discount Allowed)",
+        "required": false
+      },
+      {
+        "name": "discountAmount",
+        "type": "number",
+        "description": "Optional discount amount (positive)",
+        "required": false
+      },
+      {
+        "name": "voucherNumber",
+        "type": "string",
+        "description": "Optional voucher number",
+        "required": false
+      }
+    ]
+  },
+  {
+    "name": "search_contacts",
+    "description": "Search WhatsApp contacts by name or phone number.\n    \n    Args:\n        query: Search term to match against contact names or phone numbers\n    ",
+    "parameters": [
+      {
+        "name": "query",
+        "type": "string",
+        "description": "",
+        "required": true
+      }
+    ]
+  },
+  {
+    "name": "list_messages",
+    "description": "Get WhatsApp messages matching specified criteria with optional context.\n    \n    Args:\n        after: Optional ISO-8601 formatted string to only return messages after this date\n        before: Optional ISO-8601 formatted string to only return messages before this date\n        sender_phone_number: Optional phone number to filter messages by sender\n        chat_jid: Optional chat JID to filter messages by chat\n        query: Optional search term to filter messages by content\n        limit: Maximum number of messages to return (default 20)\n        page: Page number for pagination (default 0)\n        include_context: Whether to include messages before and after matches (default True)\n        context_before: Number of messages to include before each match (default 1)\n        context_after: Number of messages to include after each match (default 1)\n    ",
+    "parameters": [
+      {
+        "name": "after",
+        "type": "string",
+        "description": "",
+        "required": false
+      },
+      {
+        "name": "before",
+        "type": "string",
+        "description": "",
+        "required": false
+      },
+      {
+        "name": "sender_phone_number",
+        "type": "string",
+        "description": "",
+        "required": false
+      },
+      {
+        "name": "chat_jid",
+        "type": "string",
+        "description": "",
+        "required": false
+      },
+      {
+        "name": "query",
+        "type": "string",
+        "description": "",
+        "required": false
+      },
+      {
+        "name": "limit",
+        "type": "integer",
+        "description": "",
+        "required": false
+      },
+      {
+        "name": "page",
+        "type": "integer",
+        "description": "",
+        "required": false
+      },
+      {
+        "name": "include_context",
+        "type": "boolean",
+        "description": "",
+        "required": false
+      },
+      {
+        "name": "context_before",
+        "type": "integer",
+        "description": "",
+        "required": false
+      },
+      {
+        "name": "context_after",
+        "type": "integer",
+        "description": "",
+        "required": false
+      }
+    ]
+  },
+  {
+    "name": "list_chats",
+    "description": "Get WhatsApp chats matching specified criteria.\n    \n    Args:\n        query: Optional search term to filter chats by name or JID\n        limit: Maximum number of chats to return (default 20)\n        page: Page number for pagination (default 0)\n        include_last_message: Whether to include the last message in each chat (default True)\n        sort_by: Field to sort results by, either \"last_active\" or \"name\" (default \"last_active\")\n    ",
+    "parameters": [
+      {
+        "name": "query",
+        "type": "string",
+        "description": "",
+        "required": false
+      },
+      {
+        "name": "limit",
+        "type": "integer",
+        "description": "",
+        "required": false
+      },
+      {
+        "name": "page",
+        "type": "integer",
+        "description": "",
+        "required": false
+      },
+      {
+        "name": "include_last_message",
+        "type": "boolean",
+        "description": "",
+        "required": false
+      },
+      {
+        "name": "sort_by",
+        "type": "string",
+        "description": "",
+        "required": false
+      }
+    ]
+  },
+  {
+    "name": "get_chat",
+    "description": "Get WhatsApp chat metadata by JID.\n    \n    Args:\n        chat_jid: The JID of the chat to retrieve\n        include_last_message: Whether to include the last message (default True)\n    ",
+    "parameters": [
+      {
+        "name": "chat_jid",
+        "type": "string",
+        "description": "",
+        "required": true
+      },
+      {
+        "name": "include_last_message",
+        "type": "boolean",
+        "description": "",
+        "required": false
+      }
+    ]
+  },
+  {
+    "name": "get_direct_chat_by_contact",
+    "description": "Get WhatsApp chat metadata by sender phone number.\n    \n    Args:\n        sender_phone_number: The phone number to search for\n    ",
+    "parameters": [
+      {
+        "name": "sender_phone_number",
+        "type": "string",
+        "description": "",
+        "required": true
+      }
+    ]
+  },
+  {
+    "name": "get_contact_chats",
+    "description": "Get all WhatsApp chats involving the contact.\n    \n    Args:\n        jid: The contact's JID to search for\n        limit: Maximum number of chats to return (default 20)\n        page: Page number for pagination (default 0)\n    ",
+    "parameters": [
+      {
+        "name": "jid",
+        "type": "string",
+        "description": "",
+        "required": true
+      },
+      {
+        "name": "limit",
+        "type": "integer",
+        "description": "",
+        "required": false
+      },
+      {
+        "name": "page",
+        "type": "integer",
+        "description": "",
+        "required": false
+      }
+    ]
+  },
+  {
+    "name": "get_last_interaction",
+    "description": "Get most recent WhatsApp message involving the contact.\n    \n    Args:\n        jid: The JID of the contact to search for\n    ",
+    "parameters": [
+      {
+        "name": "jid",
+        "type": "string",
+        "description": "",
+        "required": true
+      }
+    ]
+  },
+  {
+    "name": "get_message_context",
+    "description": "Get context around a specific WhatsApp message.\n    \n    Args:\n        message_id: The ID of the message to get context for\n        before: Number of messages to include before the target message (default 5)\n        after: Number of messages to include after the target message (default 5)\n    ",
+    "parameters": [
+      {
+        "name": "message_id",
+        "type": "string",
+        "description": "",
+        "required": true
+      },
+      {
+        "name": "before",
+        "type": "integer",
+        "description": "",
+        "required": false
+      },
+      {
+        "name": "after",
+        "type": "integer",
+        "description": "",
+        "required": false
+      }
+    ]
+  },
+  {
+    "name": "send_message",
+    "description": "Send a WhatsApp message to a person or group. For group chats use the JID.\n\n    Args:\n        recipient: The recipient - either a phone number with country code but no + or other symbols,\n                 or a JID (e.g., \"123456789@s.whatsapp.net\" or a group JID like \"123456789@g.us\")\n        message: The message text to send\n    \n    Returns:\n        A dictionary containing success status and a status message\n    ",
+    "parameters": [
+      {
+        "name": "recipient",
+        "type": "string",
+        "description": "",
+        "required": true
+      },
+      {
+        "name": "message",
+        "type": "string",
+        "description": "",
+        "required": true
+      }
+    ]
+  },
+  {
+    "name": "send_file",
+    "description": "Send a file such as a picture, raw audio, video or document via WhatsApp to the specified recipient. For group messages use the JID.\n    \n    Args:\n        recipient: The recipient - either a phone number with country code but no + or other symbols,\n                 or a JID (e.g., \"123456789@s.whatsapp.net\" or a group JID like \"123456789@g.us\")\n        media_path: The absolute path to the media file to send (image, video, document)\n        caption: Optional text caption to send along with the file\n    \n    Returns:\n        A dictionary containing success status and a status message\n    ",
+    "parameters": [
+      {
+        "name": "recipient",
+        "type": "string",
+        "description": "",
+        "required": true
+      },
+      {
+        "name": "media_path",
+        "type": "string",
+        "description": "",
+        "required": true
+      },
+      {
+        "name": "caption",
+        "type": "string",
+        "description": "",
+        "required": false
+      }
+    ]
+  },
+  {
+    "name": "send_audio_message",
+    "description": "Send any audio file as a WhatsApp audio message to the specified recipient. For group messages use the JID. If it errors due to ffmpeg not being installed, use send_file instead.\n    \n    Args:\n        recipient: The recipient - either a phone number with country code but no + or other symbols,\n                 or a JID (e.g., \"123456789@s.whatsapp.net\" or a group JID like \"123456789@g.us\")\n        media_path: The absolute path to the audio file to send (will be converted to Opus .ogg if it's not a .ogg file)\n    \n    Returns:\n        A dictionary containing success status and a status message\n    ",
+    "parameters": [
+      {
+        "name": "recipient",
+        "type": "string",
+        "description": "",
+        "required": true
+      },
+      {
+        "name": "media_path",
+        "type": "string",
+        "description": "",
+        "required": true
+      }
+    ]
+  },
+  {
+    "name": "download_media",
+    "description": "Download media from a WhatsApp message and get the local file path.\n    \n    Args:\n        message_id: The ID of the message containing the media\n        chat_jid: The JID of the chat containing the message\n    \n    Returns:\n        A dictionary containing success status, a status message, and the file path if successful\n    ",
+    "parameters": [
+      {
+        "name": "message_id",
+        "type": "string",
+        "description": "",
+        "required": true
+      },
+      {
+        "name": "chat_jid",
+        "type": "string",
+        "description": "",
+        "required": true
+      }
+    ]
+  }
+]

@@ -1,0 +1,29 @@
+# Environment variables (Sensitive API keys/tokens)
+.env
+.env.local
+
+# Dependency folders (re-installed by start_local.bat)
+node_modules/
+tally-mcp-server/node_modules/
+tally-mcp-server/dist/
+whatsapp-mcp/whatsapp-mcp-server/.venv/
+whatsapp-mcp/whatsapp-mcp-server/__pycache__/
+whatsapp-mcp/whatsapp-mcp-server/*.pyc
+whatsapp-mcp/whatsapp-mcp-server/.python-version
+
+# WhatsApp Auth and Session Stores (Sensitive session keys)
+whatsapp-mcp/whatsapp-bridge/store/
+whatsapp-mcp/whatsapp-bridge/logs/
+whatsapp-mcp/whatsapp-bridge/whatsapp-bridge.log
+
+# Local SQLite databases (drafts and statements)
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+
+# Output statements and local log dumps
+logs/
+*.log
+npm-debug.log*
+statement_*.pdf

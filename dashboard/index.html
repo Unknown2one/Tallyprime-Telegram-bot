@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Tally Bot Dashboard</title>
+    <link rel="stylesheet" href="./style.css">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+  </head>
+  <body>
+    <div class="app-container">
+      <aside class="sidebar glass">
+        <div class="logo">
+          <h2>📊 Tally Bot</h2>
+        </div>
+        <nav>
+          <a href="#" id="navDrafts" class="active">Draft Vouchers</a>
+          <a href="#" id="navLogs">Tool Logs</a>
+        </nav>
+      </aside>
+      
+      <main class="main-content">
+        <!-- Draft Vouchers Section -->
+        <section id="draftsSection" class="view-section animate-fade-in">
+          <header>
+            <h1>Draft Vouchers</h1>
+            <p>Review and approve pending data entries dictated from Telegram.</p>
+          </header>
+
+          <!-- KPI Stats Grid -->
+          <div class="stats-grid">
+            <div class="stat-card glass">
+              <div class="stat-icon">📥</div>
+              <div class="stat-info">
+                <span class="stat-label">Pending Drafts</span>
+                <h3 id="statPendingCount">0</h3>
+              </div>
+            </div>
+            <div class="stat-card glass">
+              <div class="stat-icon">💸</div>
+              <div class="stat-info">
+                <span class="stat-label">Total Drafted Value</span>
+                <h3 id="statTotalAmount">₹ 0</h3>
+              </div>
+            </div>
+            <div class="stat-card glass">
+              <div class="stat-icon">🟢</div>
+              <div class="stat-info">
+                <span class="stat-label">Tally Link</span>
+                <h3 id="statTallyStatus" class="pulse-text">Connected</h3>
+              </div>
+            </div>
+          </div>
+
+          <!-- Sticky Bulk Actions Bar -->
+          <div id="bulkActionsBar" class="bulk-actions-bar glass hidden">
+            <div class="bulk-actions-info">
+              <span class="bulk-actions-icon">⚡</span>
+              <span id="bulkCountText">0 items selected</span>
+            </div>
+            <div class="bulk-buttons">
+              <button id="btnBulkApprove" class="btn btn-approve">Approve Selected</button>
+              <button id="btnBulkCancel" class="btn btn-cancel">Discard Selected</button>
+            </div>
+          </div>
+          
+          <div class="table-container glass animate-slide-up">
+            <table id="draftsTable">
+              <thead>
+                <tr>
+                  <th style="width: 40px; text-align: center;"><input type="checkbox" id="selectAllCheckbox"></th>
+                  <th style="width: 100px;">Date</th>
+                  <th style="width: 90px;">Type</th>
+                  <th style="width: 90px;">Vch No</th>
+                  <th>Credit (Customer)</th>
+                  <th>Debit (Cash/Bank)</th>
+                  <th style="width: 120px;">Cash Amt</th>
+                  <th style="width: 100px;">Disc Amt</th>
+                  <th>Disc Ledger</th>
+                  <th>Narration</th>
+                  <th>Tally Log</th>
+                  <th style="width: 150px;">Actions</th>
+                </tr>
+              </thead>
+              <tbody id="draftsBody">
+                <!-- Rows injected by main.js -->
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <!-- Tool Logs Section -->
+        <section id="logsSection" class="view-section hidden">
+          <header>
+            <h1>Tool Call Logs</h1>
+            <p>Monitor MCP tool execution, parameters, response metrics, and performance timing.</p>
+          </header>
+          
+          <div class="table-container glass">
+            <div class="logs-filter-bar">
+              <input type="text" id="filterToolName" placeholder="Filter by Tool (e.g. create-voucher)" class="input-filter">
+              <input type="text" id="filterRequestId" placeholder="Filter by Request ID" class="input-filter">
+              <select id="filterStatus" class="select-filter">
+                <option value="">All Statuses</option>
+                <option value="success">Success</option>
+                <option value="error">Error</option>
+              </select>
+              <button id="btnRefreshLogs" class="btn btn-primary">Refresh Logs</button>
+            </div>
+            
+            <table id="logsTable">
+              <thead>
+                <tr>
+                  <th>Timestamp</th>
+                  <th>Tool Name</th>
+                  <th>Status</th>
+                  <th>Duration</th>
+                  <th>Details</th>
+                </tr>
+              </thead>
+              <tbody id="logsBody">
+                <!-- Rows injected by main.js -->
+              </tbody>
+            </table>
+          </div>
+        </section>
+      </main>
+    </div>
+    
+    <!-- Modal for viewing detailed args and results -->
+    <div id="detailsModal" class="modal hidden">
+      <div class="modal-content glass">
+        <span class="close-modal">&times;</span>
+        <h2 id="modalTitle">Tool Execution Details</h2>
+        <div class="modal-body">
+          <div class="modal-section">
+            <h3>Arguments</h3>
+            <pre><code id="modalArgs"></code></pre>
+          </div>
+          <div class="modal-section">
+            <h3>Result / Output</h3>
+            <pre><code id="modalResult"></code></pre>
+          </div>
+        </div>
+      </div>
+    </div>
+    
+    <datalist id="ledgersDatalist"></datalist>
+    <div id="toast" class="toast hidden"></div>
+    <script type="module" src="./main.js"></script>
+  </body>
+</html>

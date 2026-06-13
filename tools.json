@@ -1,0 +1,67 @@
+[
+  {
+    "type": "function",
+    "function": {
+      "name": "list-master",
+      "description": "Fetches a list of masters (ledger, stockitem, etc.) from Tally for validation.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "collection": {
+            "type": "string",
+            "enum": ["group", "ledger", "vouchertype", "unit", "godown", "stockgroup", "stockitem", "company"],
+            "description": "The type of master to fetch."
+          },
+          "containsFilter": { "type": "string", "description": "Optional search term." }
+        },
+        "required": ["collection"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "ledger-balance",
+      "description": "Returns the closing balance of a specific ledger as on a given date.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "ledgerName": { "type": "string", "description": "Exact ledger name." },
+          "toDate": { "type": "string", "description": "Date (YYYY-MM-DD)." }
+        },
+        "required": ["ledgerName", "toDate"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "stock-summary",
+      "description": "Fetches stock item summary (opening, inward, outward, closing) for a period.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "fromDate": { "type": "string", "description": "Start date (YYYY-MM-DD)." },
+          "toDate": { "type": "string", "description": "End date (YYYY-MM-DD)." }
+        },
+        "required": ["fromDate", "toDate"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "ledger-account",
+      "description": "Fetches the ledger account statement (vouchers) for a specific period.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "ledgerName": { "type": "string" },
+          "fromDate": { "type": "string" },
+          "toDate": { "type": "string" }
+        },
+        "required": ["ledgerName", "fromDate", "toDate"]
+      }
+    }
+  }
+]
