@@ -10,6 +10,35 @@ import audio
 MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
 WHATSAPP_API_BASE_URL = "http://localhost:8080/api"
 
+# Ensure parent directory for database exists to avoid OperationalError on clean setups
+os.makedirs(os.path.dirname(os.path.abspath(MESSAGES_DB_PATH)), exist_ok=True)
+
+def is_db_initialized() -> bool:
+    """Check if the messages database exists and has the chats table."""
+    if not os.path.exists(MESSAGES_DB_PATH):
+        return False
+    try:
+        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='chats'")
+        res = cursor.fetchone()
+        conn.close()
+        return res is not None
+    except sqlite3.Error:
+        return False
+
+def assert_db_initialized():
+    """Raise a descriptive error if the database tables are not initialized."""
+    if not is_db_initialized():
+        raise RuntimeError("WhatsApp Bridge database is not initialized yet. Please make sure the WhatsApp Bridge console is open and you have scanned the QR code to log in.")
+
+def handle_request_exception(e: Exception) -> Tuple[bool, str]:
+    err_str = str(e)
+    if "Connection refused" in err_str or "Max retries exceeded" in err_str or "ConnectionError" in err_str:
+        return False, "WhatsApp Bridge is not running or port 8080 is blocked. Please ensure the WhatsApp Bridge console is open and active."
+    return False, f"WhatsApp Bridge request error: {err_str}"
+
+
 @dataclass
 class Message:
     timestamp: datetime
@@ -134,6 +163,7 @@ def list_messages(
     context_after: int = 1
 ) -> List[Message]:
     """Get messages matching the specified criteria with optional context."""
+    assert_db_initialized()
     try:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
@@ -229,6 +259,7 @@ def get_message_context(
     after: int = 5
 ) -> MessageContext:
     """Get context around a specific message."""
+    assert_db_initialized()
     try:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
@@ -324,6 +355,7 @@ def list_chats(
     sort_by: str = "last_active"
 ) -> List[Chat]:
     """Get chats matching the specified criteria."""
+    assert_db_initialized()
     try:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
@@ -392,6 +424,7 @@ def list_chats(
 
 def search_contacts(query: str) -> List[Contact]:
     """Search contacts by name or phone number."""
+    assert_db_initialized()
     try:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
@@ -440,6 +473,7 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Chat]:
         limit: Maximum number of chats to return (default 20)
         page: Page number for pagination (default 0)
     """
+    assert_db_initialized()
     try:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
@@ -485,6 +519,7 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Chat]:
 
 def get_last_interaction(jid: str) -> str:
     """Get most recent message involving the contact."""
+    assert_db_initialized()
     try:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
@@ -534,6 +569,7 @@ def get_last_interaction(jid: str) -> str:
 
 def get_chat(chat_jid: str, include_last_message: bool = True) -> Optional[Chat]:
     """Get chat metadata by JID."""
+    assert_db_initialized()
     try:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
@@ -582,6 +618,7 @@ def get_chat(chat_jid: str, include_last_message: bool = True) -> Optional[Chat]
 
 def get_direct_chat_by_contact(sender_phone_number: str) -> Optional[Chat]:
     """Get chat metadata by sender phone number."""
+    assert_db_initialized()
     try:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
@@ -644,7 +681,7 @@ def send_message(recipient: str, message: str) -> Tuple[bool, str]:
             return False, f"Error: HTTP {response.status_code} - {response.text}"
             
     except requests.RequestException as e:
-        return False, f"Request error: {str(e)}"
+        return handle_request_exception(e)
     except json.JSONDecodeError:
         return False, f"Error parsing response: {response.text}"
     except Exception as e:
@@ -680,7 +717,7 @@ def send_file(recipient: str, media_path: str, caption: Optional[str] = None) ->
             return False, f"Error: HTTP {response.status_code} - {response.text}"
             
     except requests.RequestException as e:
-        return False, f"Request error: {str(e)}"
+        return handle_request_exception(e)
     except json.JSONDecodeError:
         return False, f"Error parsing response: {response.text}"
     except Exception as e:
@@ -720,7 +757,7 @@ def send_audio_message(recipient: str, media_path: str) -> Tuple[bool, str]:
             return False, f"Error: HTTP {response.status_code} - {response.text}"
             
     except requests.RequestException as e:
-        return False, f"Request error: {str(e)}"
+        return handle_request_exception(e)
     except json.JSONDecodeError:
         return False, f"Error parsing response: {response.text}"
     except Exception as e:

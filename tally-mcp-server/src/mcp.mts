@@ -1283,7 +1283,7 @@ export async function registerMcpServer(): Promise<McpServer> {
 
             const scriptPath = path.resolve('scripts/ledger_pdf.py');
             const pdfFilePath = path.resolve(`statement_${randomId}.pdf`);
-            const cmd = `python "${scriptPath}" "${pdfFilePath}" < "${jsonFilePath}"`;
+            const cmd = `uv run "${scriptPath}" "${pdfFilePath}" < "${jsonFilePath}"`;
             
             const { stdout, stderr } = await execAsync(cmd);
             await fs.unlink(jsonFilePath).catch(()=>{});

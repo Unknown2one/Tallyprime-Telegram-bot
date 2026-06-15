@@ -1,3 +1,9 @@
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#     "reportlab",
+# ]
+# ///
 import sys
 import json
 import logging

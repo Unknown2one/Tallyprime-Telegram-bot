@@ -1,3 +1,9 @@
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#     "faster-whisper",
+# ]
+# ///
 import sys
 import os
 from faster_whisper import WhisperModel

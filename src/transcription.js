@@ -51,7 +51,7 @@ async function transcribeVoice(ctx) {
 
             // Local transcription fallback
             logger.info(`Starting local transcription for ${filePath}...`);
-            const { stdout } = await execPromise(`python scripts/transcribe.py "${filePath}"`, {
+            const { stdout } = await execPromise(`uv run scripts/transcribe.py "${filePath}"`, {
                 env: { ...process.env, PYTHONIOENCODING: 'utf-8' }
             });
             result = stdout.trim();

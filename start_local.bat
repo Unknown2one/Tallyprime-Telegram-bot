@@ -42,6 +42,21 @@ if %errorlevel% neq 0 (
     echo ✅ uv Python manager is installed.
 )
 
+:: Check FFmpeg
+where ffmpeg >nul 2>nul
+if %errorlevel% neq 0 (
+    echo ⚙️ ffmpeg not found. Installing ffmpeg via winget...
+    winget install --id Gyan.FFmpeg -e --accept-source-agreements --accept-package-agreements
+    echo.
+    echo [INFO] ffmpeg was successfully installed.
+    echo Please close this window and double-click start_local.bat again to reload environment paths.
+    pause
+    exit /b 0
+) else (
+    echo ✅ ffmpeg is installed.
+)
+
+
 echo.
 echo ⚙️ Installing Node.js dependencies for Bot Orchestrator...
 call npm install
